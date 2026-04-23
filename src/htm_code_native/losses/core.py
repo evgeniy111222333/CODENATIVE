@@ -135,6 +135,42 @@ def diagnostic_probe_loss(
     )
 
 
+def edit_span_loss(
+    edit_token_scores: torch.Tensor | None,
+    target_token_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if edit_token_scores is None or target_token_mask is None:
+        device = edit_token_scores.device if isinstance(edit_token_scores, torch.Tensor) else None
+        return torch.tensor(0.0, device=device)
+    if edit_token_scores.numel() == 0:
+        return edit_token_scores.new_tensor(0.0)
+    targets = target_token_mask.to(device=edit_token_scores.device, dtype=torch.float32)
+    return F.binary_cross_entropy_with_logits(edit_token_scores, targets)
+
+
+def edit_patch_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    supervision_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    return masked_autoregressive_loss(logits, targets, supervision_mask)
+
+
+def diagnostic_alignment_loss(
+    edit_token_scores: torch.Tensor | None,
+    target_token_mask: torch.Tensor | None,
+    diagnostic_token_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if edit_token_scores is None or target_token_mask is None or diagnostic_token_mask is None:
+        device = edit_token_scores.device if isinstance(edit_token_scores, torch.Tensor) else None
+        return torch.tensor(0.0, device=device)
+    focus_mask = diagnostic_token_mask.to(device=edit_token_scores.device, dtype=torch.bool)
+    if not bool(focus_mask.any().item()):
+        return edit_token_scores.new_tensor(0.0)
+    targets = target_token_mask.to(device=edit_token_scores.device, dtype=torch.float32)
+    return F.binary_cross_entropy_with_logits(edit_token_scores[focus_mask], targets[focus_mask])
+
+
 def routing_loss(
     router_post_logits: list[torch.Tensor],
     teacher_indices: list[int],

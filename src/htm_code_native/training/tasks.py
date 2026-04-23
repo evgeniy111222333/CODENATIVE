@@ -69,6 +69,8 @@ def parse_task_document(file_path: str) -> tuple[AlignedDocument, object]:
 
 def infer_task_label(file_path: str) -> TaskLabel:
     lowered = str(file_path).replace("\\", "/").lower()
+    if "edit" in lowered or "patch" in lowered:
+        return TaskLabel.EDIT_FIX
     if "repo_graph_workspace" in lowered:
         return TaskLabel.REPO_GRAPH
     if "recent_copy" in lowered:
@@ -89,7 +91,11 @@ def build_task_example(
     metadata: dict[str, object] | None = None,
 ) -> TaskExample:
     label = TaskLabel(task_label) if isinstance(task_label, str) else (task_label or infer_task_label(file_path))
-    resolved_root = str(resolve_repo_root(file_path, repo_root)) if label == TaskLabel.REPO_GRAPH else repo_root
+    resolved_root = (
+        str(resolve_repo_root(file_path, repo_root))
+        if label in {TaskLabel.REPO_GRAPH, TaskLabel.EDIT_FIX}
+        else repo_root
+    )
     effective_reports = tuple(report_paths) if report_paths else tuple(default_report_paths(Path(resolved_root))) if resolved_root else ()
     return TaskExample(
         file_path=file_path,
@@ -105,11 +111,12 @@ def build_task_batch(
     config: HTMCodeNativeConfig,
     registry: VocabularyRegistry | None = None,
 ) -> TaskBatch:
+    active_registry = registry or VocabularyRegistry(capacity=config.model.vocabulary_size)
     document, boundaries = parse_task_document(example.file_path)
     if example.task_label == TaskLabel.INFILL:
         infill_start, infill_end = _select_infill_span(document)
         masked_document = _mask_document_span(document, infill_start, infill_end)
-        batch = build_batch_from_document(masked_document, boundaries, config, registry=registry)
+        batch = build_batch_from_document(masked_document, boundaries, config, registry=active_registry)
         supervision_mask = torch.zeros(len(masked_document.tokens), dtype=torch.bool)
         for token_index in range(infill_start, infill_end):
             supervision_index = token_index - 1
@@ -125,16 +132,52 @@ def build_task_batch(
             batch=batch,
             supervision_mask=supervision_mask,
             infill_span=(infill_start, infill_end),
+            edit_target_span=None,
+            replacement_text=None,
             metadata=metadata,
         )
+    if example.task_label == TaskLabel.EDIT_FIX:
+        edit_start, edit_end, replacement_text = _select_edit_target(document, example)
+        masked_document = _mask_document_span(document, edit_start, edit_end)
+        batch = build_batch_from_document(masked_document, boundaries, config, registry=active_registry)
+        supervision_mask = torch.zeros(len(masked_document.tokens), dtype=torch.bool)
+        target_token_mask = torch.zeros(len(masked_document.tokens), dtype=torch.bool)
+        diagnostic_token_mask = torch.zeros(len(masked_document.tokens), dtype=torch.bool)
+        replacement_token_id = active_registry.encode_token(replacement_text)
+        for token_index in range(edit_start, edit_end):
+            target_token_mask[token_index] = True
+            left = max(0, token_index - 1)
+            right = min(len(masked_document.tokens), token_index + 2)
+            diagnostic_token_mask[left:right] = True
+            supervision_index = token_index - 1
+            if supervision_index >= 0:
+                supervision_mask[supervision_index] = True
+                batch.targets[supervision_index] = replacement_token_id
+        return TaskBatch(
+            example=example,
+            batch=batch,
+            supervision_mask=supervision_mask,
+            infill_span=None,
+            edit_target_span=(edit_start, edit_end),
+            replacement_text=replacement_text,
+            metadata={
+                "task_label": example.task_label.value,
+                "probe_kind": example.metadata.get("probe_kind", "edit_fix"),
+                "edit_target_token_mask": target_token_mask,
+                "diagnostic_token_mask": diagnostic_token_mask,
+                "replacement_text": replacement_text,
+            },
+        )
 
-    batch = build_batch_from_document(document, boundaries, config, registry=registry)
+    batch = build_batch_from_document(document, boundaries, config, registry=active_registry)
     supervision_mask = torch.ones(len(document.tokens), dtype=torch.bool)
     return TaskBatch(
         example=example,
         batch=batch,
         supervision_mask=supervision_mask,
         infill_span=None,
+        edit_target_span=None,
+        replacement_text=None,
         metadata={
             "task_label": example.task_label.value,
             "probe_kind": example.metadata.get("probe_kind"),
@@ -190,10 +233,25 @@ def default_task_examples(
                 TaskLabel.REPO_GRAPH,
                 repo_root=resolved_repo_root,
                 report_paths=report_paths,
-                metadata={"probe_kind": "edit_fix"},
+                metadata={"probe_kind": "diagnostic_to_symbol"},
             ),
         ]
         examples.setdefault(TaskLabel.REPO_GRAPH, []).extend(repo_examples)
+        examples.setdefault(TaskLabel.EDIT_FIX, []).append(
+            build_task_example(
+                str(repo_graph_path),
+                TaskLabel.EDIT_FIX,
+                repo_root=resolved_repo_root,
+                report_paths=report_paths,
+                metadata={
+                    "probe_kind": "edit_fix",
+                    "target_token_value": "GRAPH_SHARED_NAME",
+                    "replacement_text": "\"shared_graph_token\"",
+                    "instruction": "Inline shared_graph_token expected by diagnostics in app/core.py",
+                    "target_symbol": "GRAPH_SHARED_NAME",
+                },
+            )
+        )
 
     return {label: bucket for label, bucket in examples.items() if bucket}
 
@@ -215,7 +273,8 @@ def phase_task_weights(phase: TrainingPhase) -> dict[TaskLabel, int]:
         TaskLabel.INFILL: 15,
         TaskLabel.RECENT_COPY: 15,
         TaskLabel.EPISODIC_RECALL: 15,
-        TaskLabel.REPO_GRAPH: 20,
+        TaskLabel.REPO_GRAPH: 10,
+        TaskLabel.EDIT_FIX: 10,
     }
 
 
@@ -287,3 +346,29 @@ def _mask_document_span(document: AlignedDocument, start: int, end: int) -> Alig
         source_text=masked_bytes.decode("utf-8", errors="ignore"),
         tokens=masked_tokens,
     )
+
+
+def _select_edit_target(
+    document: AlignedDocument,
+    example: TaskExample,
+) -> tuple[int, int, str]:
+    target_value = str(example.metadata.get("target_token_value", "")).strip()
+    replacement_text = str(example.metadata.get("replacement_text", "")).strip()
+    if not replacement_text:
+        replacement_text = "\"patched_value\""
+    if target_value:
+        for token in document.tokens:
+            if token.value == target_value:
+                return token.index, token.index + 1, replacement_text
+    target_symbol = str(example.metadata.get("target_symbol", "")).strip()
+    if target_symbol:
+        for symbol in document.symbols:
+            if symbol.name != target_symbol:
+                continue
+            for token in document.tokens:
+                if token.start_byte >= symbol.start_byte and token.end_byte <= symbol.end_byte:
+                    return token.index, token.index + 1, replacement_text
+    for token in document.tokens:
+        if token.token_class.value == "identifier":
+            return token.index, token.index + 1, replacement_text
+    return 0, min(1, len(document.tokens)), replacement_text

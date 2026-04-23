@@ -113,6 +113,13 @@ class PhaseAModelConfig:
     probe_min_episodic_hit_rate: float = 0.01
     probe_min_symbol_link_hit_rate: float = 0.01
     probe_min_route_entropy: float = 0.5
+    probe_min_patch_candidate_valid_rate: float = 0.25
+    probe_min_best_patch_hit_rate: float = 0.25
+    probe_min_diagnostic_to_span_recall: float = 0.25
+    edit_span_weight: float = 0.1
+    edit_patch_weight: float = 0.2
+    diagnostic_alignment_weight: float = 0.1
+    edit_max_candidates: int = 3
 
 
 @dataclass(slots=True)

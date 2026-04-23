@@ -126,6 +126,7 @@ class PhaseACodeModel(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_size * 2, hidden_size),
         )
+        self.edit_span_head = nn.Linear(hidden_size + config.model.graph_value_dim, 1)
         self.vocab_head = nn.Linear(hidden_size, config.model.vocabulary_size)
         self.semantic_head = (
             nn.Linear(hidden_size, config.model.vocabulary_size)
@@ -196,6 +197,7 @@ class PhaseACodeModel(nn.Module):
         energy_proxy = torch.zeros(seq_len, device=device)
         warmup_beta = torch.ones(seq_len, device=device)
         collapse_detected = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        edit_token_scores = torch.zeros(seq_len, device=device)
 
         total_hot_reads = 0
         total_cold_reads = 0
@@ -271,7 +273,7 @@ class PhaseACodeModel(nn.Module):
             graph_task_relevant = graph_available and self._graph_task_is_relevant(batch, step)
             graph_enabled = phase_policy["graph_enabled"] and graph_task_relevant
             if phase_name == TrainingPhase.PHASE_D:
-                graph_enabled = graph_enabled and task_name == TaskLabel.REPO_GRAPH
+                graph_enabled = graph_enabled and task_name in {TaskLabel.REPO_GRAPH, TaskLabel.EDIT_FIX}
             graph_task_eligible_steps += int(graph_task_relevant)
             metadata = self._router_metadata(
                 batch=batch,
@@ -510,6 +512,16 @@ class PhaseACodeModel(nn.Module):
                 post_router_features,
                 pre_mask=pre_mask,
             )
+            if task_name == TaskLabel.EDIT_FIX:
+                if eem_available:
+                    post_mask[3] = True
+                if graph_enabled:
+                    post_mask[4] = True
+                masked_logits = post_logits.clone()
+                masked_logits[~post_mask] = -1e9
+                learned_weights = torch.softmax(masked_logits / self.config.model.route_temperature, dim=-1)
+                learned_weights = torch.where(post_mask, learned_weights, torch.zeros_like(learned_weights))
+                learned_weights = learned_weights / learned_weights.sum().clamp_min(1e-8)
             oracle_mask = self._oracle_availability(
                 copy_hit=erm_enabled and has_copy_target,
                 episodic_hit=eem_enabled and has_episodic_target,
@@ -545,6 +557,10 @@ class PhaseACodeModel(nn.Module):
             invoked_lanes[step] = pre_mask
             router_post_mask[step] = post_mask
             router_weights[step] = learned_weights
+            if task_name == TaskLabel.EDIT_FIX:
+                edit_prior = torch.tensor([1.0, 1.0, 1.0, 1.15, 1.25], device=device)
+                effective_weights = effective_weights * edit_prior
+                effective_weights = effective_weights / effective_weights.sum().clamp_min(1e-8)
             effective_router_weights[step] = effective_weights
             oracle_router_weights[step] = oracle_weights
             warmup_beta[step] = step_warmup_beta
@@ -572,6 +588,7 @@ class PhaseACodeModel(nn.Module):
             hidden_states[step] = hidden
             semantic_contexts[step] = semantic_context
             graph_contexts[step] = graph_context
+            edit_token_scores[step] = self.edit_span_head(torch.cat([hidden, graph_context], dim=-1)).squeeze(-1)
 
             self.semantic_memory.write_hot(step_state)
             if maintenance_budget > 0.0:
@@ -725,6 +742,7 @@ class PhaseACodeModel(nn.Module):
                 "router_post_logits": router_post_logits,
                 "router_post_masks": router_post_masks,
                 "oracle_router_weights": oracle_router_weight_list,
+                "edit_token_scores": edit_token_scores,
                 "task_supervision_mask": None,
                 "infill_span": None,
                 "maintenance_decision": None,
@@ -831,6 +849,8 @@ class PhaseACodeModel(nn.Module):
             return TaskLabel.RECENT_COPY
         if "episodic" in file_name:
             return TaskLabel.EPISODIC_RECALL
+        if "edit" in file_name or "patch" in file_name:
+            return TaskLabel.EDIT_FIX
         if self.repo_graph_root is not None and self.repo_graph_memory.index is not None:
             normalized = self._normalize_graph_path(batch.document.file_path)
             if normalized in self.repo_graph_memory.index.node_ids_by_file:

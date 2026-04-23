@@ -38,6 +38,7 @@ class TaskLabel(str, Enum):
     RECENT_COPY = "recent_copy"
     EPISODIC_RECALL = "episodic_recall"
     REPO_GRAPH = "repo_graph"
+    EDIT_FIX = "edit_fix"
 
 
 @dataclass(slots=True)
@@ -483,6 +484,8 @@ class TaskBatch:
     batch: PhaseABatch
     supervision_mask: torch.Tensor
     infill_span: tuple[int, int] | None = None
+    edit_target_span: tuple[int, int] | None = None
+    replacement_text: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -515,3 +518,59 @@ class PhaseExitReport:
     metrics: dict[str, float]
     failing_checks: tuple[str, ...] = ()
     example_count: int = 0
+
+
+@dataclass(slots=True)
+class EditRequest:
+    file_path: str
+    instruction: str
+    repo_root: str | None = None
+    report_paths: tuple[str, ...] = ()
+    target_symbol: str | None = None
+    phase: str | None = None
+    max_candidates: int = 3
+
+
+@dataclass(slots=True)
+class EditTargetSpan:
+    start_byte: int
+    end_byte: int
+    token_start: int
+    token_end: int
+    node_type: str | None
+    symbol_name: str | None
+    score: float
+    reasons: tuple[str, ...]
+    source_text: str
+
+
+@dataclass(slots=True)
+class PatchCandidate:
+    span: EditTargetSpan
+    replacement_text: str
+    patched_source: str
+    diff_preview: str
+    valid: bool
+    validation_errors: tuple[str, ...]
+    score: float
+    support_terms: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class PatchPlan:
+    file_path: str
+    original_source: str
+    patch_candidates: tuple[PatchCandidate, ...]
+    best_candidate: PatchCandidate | None
+    validation_summary: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class EditRunOutput:
+    request: EditRequest
+    selected_context: dict[str, Any]
+    router_summary: dict[str, Any]
+    span_candidates: tuple[EditTargetSpan, ...]
+    patch_plan: PatchPlan
+    diff_preview: str
+    validation_summary: dict[str, Any] = field(default_factory=dict)
