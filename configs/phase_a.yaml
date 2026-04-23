@@ -1,0 +1,35 @@
+model:
+  vocabulary_size: 4096
+  model_dim: 128
+  byte_embedding_dim: 32
+  max_position_embeddings: 4096
+  max_byte_window: 32
+  max_ast_depth: 16
+  semantic_blend: 0.2
+  use_semantic_head: true
+  recent_window: 128
+  erm_key_dim: 128
+  erm_blend: 0.15
+  copy_recent_weight: 0.2
+  max_recent_byte_payload: 32
+  eem_key_dim: 128
+  pointer_key_dim: 128
+  eem_blend: 0.15
+  copy_episodic_weight: 0.2
+  min_chunk_tokens: 16
+  max_chunk_tokens: 128
+  eem_top_k: 2
+  max_episodic_chunks: 64
+hssm:
+  max_level: 5
+  hidden_size: 128
+  stride_base: 2
+  norm_clip: 10.0
+semantic_memory:
+  key_dim: 128
+  hot_slots: 32
+  cold_slots: 128
+  beam_width: 8
+  consolidation_fill_threshold: 0.75
+  maintenance_budget: 1.0
+  min_slots_for_consolidation: 8
