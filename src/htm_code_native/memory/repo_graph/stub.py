@@ -1110,6 +1110,15 @@ class RepositoryGraphIndexer:
         return unique
 
 
+@dataclass(slots=True)
+class RepoGraphCandidateIndex:
+    nodes_by_file: dict[str, tuple[str, ...]]
+    nodes_by_kind: dict[str, tuple[str, ...]]
+    nodes_by_name: dict[str, tuple[str, ...]]
+    nodes_by_copy_term: dict[str, tuple[str, ...]]
+    nodes_by_symbol_name: dict[str, tuple[str, ...]]
+
+
 class RepositoryGraphMemory(nn.Module):
     def __init__(
         self,
@@ -1123,6 +1132,7 @@ class RepositoryGraphMemory(nn.Module):
         symbol_bias: float,
         test_bias: float,
         diagnostic_bias: float,
+        candidate_budget: int = 64,
         value_dim: int | None = None,
     ) -> None:
         super().__init__()
@@ -1137,6 +1147,7 @@ class RepositoryGraphMemory(nn.Module):
         self.symbol_bias = symbol_bias
         self.test_bias = test_bias
         self.diagnostic_bias = diagnostic_bias
+        self.candidate_budget = max(1, candidate_budget)
         self.term_vocab_size = 2048
         self.kind_to_id = {
             "file": 0,
@@ -1178,11 +1189,13 @@ class RepositoryGraphMemory(nn.Module):
         self.prior_head = nn.Linear(self.value_dim, vocab_size)
         self.index: RepositoryGraphIndex | None = None
         self.node_edge_kinds: dict[str, tuple[str, ...]] = {}
+        self.candidate_index: RepoGraphCandidateIndex | None = None
 
     def set_index(self, index: RepositoryGraphIndex | None) -> None:
         self.index = index
         if index is None:
             self.node_edge_kinds = {}
+            self.candidate_index = None
             return
         edge_kinds: dict[str, list[str]] = {}
         for edge in index.edges:
@@ -1191,6 +1204,7 @@ class RepositoryGraphMemory(nn.Module):
         self.node_edge_kinds = {
             node_id: tuple(kinds) for node_id, kinds in edge_kinds.items()
         }
+        self.candidate_index = self._build_candidate_index(index)
 
     def reset(self) -> None:
         return None
@@ -1237,8 +1251,18 @@ class RepositoryGraphMemory(nn.Module):
         import_closure = set(self.index.import_closure_by_file.get(context.file_path, ()))
         test_files = set(self.index.test_files_by_source.get(context.file_path, ()))
         diagnostic_files = set(self.index.diagnostic_files_by_source.get(context.file_path, ()))
+        candidate_nodes = self._candidate_nodes_for_context(
+            context=context,
+            import_closure=import_closure,
+            test_files=test_files,
+            diagnostic_files=diagnostic_files,
+        )
+        total_node_count = len(self.index.nodes)
+        candidate_pool_size = len(candidate_nodes)
+        pruned_node_count = max(total_node_count - candidate_pool_size, 0)
+        prune_rate = pruned_node_count / max(total_node_count, 1)
 
-        for node in self.index.nodes:
+        for node in candidate_nodes:
             key, value = self._encode_node(node, device)
             score_tensor = (query @ key) / math.sqrt(self.key_dim)
             score = float(score_tensor.detach().item())
@@ -1294,6 +1318,10 @@ class RepositoryGraphMemory(nn.Module):
                 test_hits=0,
                 diagnostic_hits=0,
                 target_node_id=None,
+                candidate_pool_size=candidate_pool_size,
+                total_node_count=total_node_count,
+                pruned_node_count=pruned_node_count,
+                prune_rate=prune_rate,
             )
 
         score_tensor = torch.stack([item[1] for item in selected], dim=0)
@@ -1361,7 +1389,159 @@ class RepositoryGraphMemory(nn.Module):
             test_hits=test_hits,
             diagnostic_hits=diagnostic_hits,
             target_node_id=target_node_id,
+            candidate_pool_size=candidate_pool_size,
+            total_node_count=total_node_count,
+            pruned_node_count=pruned_node_count,
+            prune_rate=prune_rate,
         )
+
+    def _build_candidate_index(self, index: RepositoryGraphIndex) -> RepoGraphCandidateIndex:
+        by_file: dict[str, list[str]] = {}
+        by_kind: dict[str, list[str]] = {}
+        by_name: dict[str, list[str]] = {}
+        by_copy_term: dict[str, list[str]] = {}
+        by_symbol_name: dict[str, list[str]] = {}
+
+        for node in index.nodes:
+            if node.file_path is not None:
+                self._add_candidate_bucket(by_file, node.file_path, node.node_id)
+            self._add_candidate_bucket(by_kind, node.kind, node.node_id)
+            self._add_candidate_bucket(by_name, node.name, node.node_id)
+            symbol_name = str(node.metadata.get("symbol_name", "")).strip()
+            if symbol_name:
+                self._add_candidate_bucket(by_symbol_name, symbol_name, node.node_id)
+            if node.kind in {"symbol", "function", "class"}:
+                self._add_candidate_bucket(by_symbol_name, node.name, node.node_id)
+            for term in node.copy_terms:
+                for alias in self._copy_term_aliases(term):
+                    self._add_candidate_bucket(by_copy_term, alias, node.node_id)
+
+        return RepoGraphCandidateIndex(
+            nodes_by_file=self._freeze_candidate_buckets(by_file),
+            nodes_by_kind=self._freeze_candidate_buckets(by_kind),
+            nodes_by_name=self._freeze_candidate_buckets(by_name),
+            nodes_by_copy_term=self._freeze_candidate_buckets(by_copy_term),
+            nodes_by_symbol_name=self._freeze_candidate_buckets(by_symbol_name),
+        )
+
+    def _candidate_nodes_for_context(
+        self,
+        *,
+        context: RepoGraphQueryContext,
+        import_closure: set[str],
+        test_files: set[str],
+        diagnostic_files: set[str],
+    ) -> list[RepositoryGraphNode]:
+        if self.index is None:
+            return []
+        if self.candidate_index is None:
+            return list(self.index.nodes)
+
+        mandatory_ids: list[str] = []
+        optional_ids: list[str] = []
+
+        exact_terms = self._query_exact_terms(context)
+        for term in exact_terms:
+            self._extend_candidate_ids(mandatory_ids, self.candidate_index.nodes_by_name.get(term, ()))
+            self._extend_candidate_ids(mandatory_ids, self.candidate_index.nodes_by_symbol_name.get(term, ()))
+            for alias in self._copy_term_aliases(term):
+                self._extend_candidate_ids(mandatory_ids, self.candidate_index.nodes_by_copy_term.get(alias, ()))
+
+        same_file_ids = self.candidate_index.nodes_by_file.get(context.file_path, ())
+        self._extend_candidate_ids(optional_ids, self._symbol_first_ids(same_file_ids))
+        for file_path in sorted(import_closure):
+            self._extend_candidate_ids(optional_ids, self._symbol_first_ids(self.candidate_index.nodes_by_file.get(file_path, ())))
+
+        probe_kind = context.probe_kind or ""
+        if probe_kind in {"diagnostic_to_symbol", "edit_fix"}:
+            for file_path in sorted(diagnostic_files):
+                self._extend_candidate_ids(optional_ids, self.candidate_index.nodes_by_file.get(file_path, ()))
+            for file_path in sorted(test_files):
+                self._extend_candidate_ids(optional_ids, self.candidate_index.nodes_by_file.get(file_path, ()))
+        else:
+            if exact_terms:
+                self._extend_candidate_ids(optional_ids, self.candidate_index.nodes_by_kind.get("symbol", ()))
+                self._extend_candidate_ids(optional_ids, self.candidate_index.nodes_by_kind.get("function", ()))
+                self._extend_candidate_ids(optional_ids, self.candidate_index.nodes_by_kind.get("class", ()))
+            for file_path in sorted(test_files):
+                self._extend_candidate_ids(optional_ids, self.candidate_index.nodes_by_file.get(file_path, ()))
+            for file_path in sorted(diagnostic_files):
+                self._extend_candidate_ids(optional_ids, self.candidate_index.nodes_by_file.get(file_path, ()))
+
+        candidate_ids = self._merge_candidate_ids(mandatory_ids, optional_ids)
+        if not candidate_ids:
+            return list(self.index.nodes)
+        return [
+            self.index.nodes_by_id[node_id]
+            for node_id in candidate_ids
+            if node_id in self.index.nodes_by_id
+        ]
+
+    def _query_exact_terms(self, context: RepoGraphQueryContext) -> tuple[str, ...]:
+        values = (
+            context.target_symbol_name,
+            context.current_symbol_name,
+            context.target_token_value,
+            context.target_copy_value,
+            context.token_value,
+        )
+        seen: set[str] = set()
+        terms: list[str] = []
+        for value in values:
+            text = str(value or "").strip().strip("\"'")
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            terms.append(text)
+        return tuple(terms)
+
+    def _symbol_first_ids(self, node_ids: Sequence[str]) -> tuple[str, ...]:
+        if self.index is None:
+            return tuple(node_ids)
+        symbol_ids: list[str] = []
+        other_ids: list[str] = []
+        for node_id in node_ids:
+            node = self.index.nodes_by_id.get(node_id)
+            if node is not None and node.kind in {"symbol", "function", "class"}:
+                symbol_ids.append(node_id)
+            else:
+                other_ids.append(node_id)
+        return (*symbol_ids, *other_ids)
+
+    def _merge_candidate_ids(self, mandatory_ids: Sequence[str], optional_ids: Sequence[str]) -> tuple[str, ...]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for node_id in mandatory_ids:
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            merged.append(node_id)
+        optional_added = 0
+        for node_id in optional_ids:
+            if node_id in seen:
+                continue
+            if optional_added >= self.candidate_budget:
+                break
+            seen.add(node_id)
+            merged.append(node_id)
+            optional_added += 1
+        return tuple(merged)
+
+    def _add_candidate_bucket(self, buckets: dict[str, list[str]], key: str, node_id: str) -> None:
+        text = str(key).strip()
+        if not text:
+            return
+        bucket = buckets.setdefault(text, [])
+        if node_id not in bucket:
+            bucket.append(node_id)
+
+    def _extend_candidate_ids(self, destination: list[str], node_ids: Sequence[str]) -> None:
+        for node_id in node_ids:
+            if node_id not in destination:
+                destination.append(node_id)
+
+    def _freeze_candidate_buckets(self, buckets: dict[str, list[str]]) -> dict[str, tuple[str, ...]]:
+        return {key: tuple(value) for key, value in buckets.items()}
 
     def _copy_token_ids_for_terms(
         self,

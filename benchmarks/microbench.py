@@ -203,6 +203,10 @@ def main() -> int:
     exact_span_recall = 0.0
     exact_recent_payload_hits = 0.0
     exact_episodic_payload_hits = 0.0
+    exact_emission_candidate_coverage = 0.0
+    exact_byte_emission_hit_rate = 0.0
+    exact_span_emission_hit_rate = 0.0
+    exact_emission_candidates = 0.0
     episodic_hits = 0.0
     identifier_recall = 0.0
     string_recall = 0.0
@@ -215,6 +219,9 @@ def main() -> int:
     long_number_recall = 0.0
     graph_reads = 0.0
     graph_candidates = 0.0
+    graph_candidate_pool_size = 0.0
+    graph_total_nodes = 0.0
+    graph_pruned_nodes = 0.0
     graph_symbol_recall = 0.0
     graph_test_recall = 0.0
     graph_diagnostic_recall = 0.0
@@ -260,6 +267,18 @@ def main() -> int:
             )
             exact_recent_payload_hits += float(output.memory_stats["exact_recent_payload_hits"])
             exact_episodic_payload_hits += float(output.memory_stats["exact_episodic_payload_hits"])
+            exact_emission_candidate_coverage += float(
+                output.auxiliary["phase_exit_probe_metrics"]["exact_emission_candidate_coverage"]
+            )
+            exact_byte_emission_hit_rate += float(
+                output.auxiliary["phase_exit_probe_metrics"]["exact_byte_emission_hit_rate"]
+            )
+            exact_span_emission_hit_rate += float(
+                output.auxiliary["phase_exit_probe_metrics"]["exact_span_emission_hit_rate"]
+            )
+            exact_emission_candidates += float(
+                output.auxiliary["phase_exit_probe_metrics"]["avg_exact_emission_candidates"]
+            )
             episodic_hits += output.memory_stats["episodic_target_hits"]
             identifier_recall += _mean_target_probability(output, window_batch, "identifier")
             string_recall += _mean_target_probability(output, window_batch, "string")
@@ -272,6 +291,9 @@ def main() -> int:
             long_number_recall += _mean_episodic_target_probability(output, window_batch, "number")
             graph_reads += output.memory_stats["graph_reads"]
             graph_candidates += output.memory_stats["graph_candidates"]
+            graph_candidate_pool_size += output.memory_stats["graph_candidate_pool_size"]
+            graph_total_nodes += output.memory_stats["graph_total_nodes_considered"]
+            graph_pruned_nodes += output.memory_stats["graph_pruned_nodes"]
             graph_symbol_recall += _mean_graph_target_probability(
                 output,
                 window_batch,
@@ -324,6 +346,10 @@ def main() -> int:
             "exact_span_recall": exact_span_recall / max(total_windows, 1.0),
             "avg_exact_recent_payload_hits": exact_recent_payload_hits / iterations,
             "avg_exact_episodic_payload_hits": exact_episodic_payload_hits / iterations,
+            "exact_emission_candidate_coverage": exact_emission_candidate_coverage / max(total_windows, 1.0),
+            "exact_byte_emission_hit_rate": exact_byte_emission_hit_rate / max(total_windows, 1.0),
+            "exact_span_emission_hit_rate": exact_span_emission_hit_rate / max(total_windows, 1.0),
+            "avg_exact_emission_candidates": exact_emission_candidates / max(total_windows, 1.0),
             "avg_episodic_target_hits": episodic_hits / iterations,
             "repeated_identifier_recall": identifier_recall / iterations,
             "repeated_string_recall": string_recall / iterations,
@@ -336,6 +362,8 @@ def main() -> int:
             "long_range_number_recall": long_number_recall / iterations,
             "avg_graph_reads": graph_reads / iterations,
             "avg_graph_candidates": graph_candidates / iterations,
+            "avg_graph_candidate_pool_size": graph_candidate_pool_size / iterations,
+            "avg_graph_prune_rate": graph_pruned_nodes / max(graph_total_nodes, 1.0),
             "graph_symbol_recall": graph_symbol_recall / iterations,
             "graph_test_recall": graph_test_recall / iterations,
             "graph_diagnostic_recall": graph_diagnostic_recall / iterations,

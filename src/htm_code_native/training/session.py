@@ -69,6 +69,12 @@ def _aggregate_session_metrics(
     exact_payload_steps = _sum_memory_stat(outputs, "exact_payload_candidate_steps")
     exact_byte_hits = _sum_memory_stat(outputs, "exact_byte_candidate_hits")
     exact_span_hits = _sum_memory_stat(outputs, "exact_span_candidate_hits")
+    exact_emission_target_steps = _sum_memory_stat(outputs, "exact_emission_target_steps")
+    exact_emission_supervision_steps = _sum_memory_stat(outputs, "exact_emission_supervision_steps")
+    exact_emission_candidate_steps = _sum_memory_stat(outputs, "exact_emission_candidate_steps")
+    exact_emission_candidate_count = _sum_memory_stat(outputs, "exact_emission_candidate_count")
+    exact_byte_emission_hits = _sum_memory_stat(outputs, "exact_byte_emission_hits")
+    exact_span_emission_hits = _sum_memory_stat(outputs, "exact_span_emission_hits")
     semantic_cold_clusters = float(
         sum(len(clusters) for clusters in session_state.semantic_memory.cold_clusters.values())
     )
@@ -93,6 +99,11 @@ def _aggregate_session_metrics(
         "exact_episodic_payload_hits": _sum_memory_stat(outputs, "exact_episodic_payload_hits"),
         "exact_recent_payload_candidates": _sum_memory_stat(outputs, "exact_recent_payload_candidates"),
         "exact_episodic_payload_candidates": _sum_memory_stat(outputs, "exact_episodic_payload_candidates"),
+        "exact_emission_candidate_coverage": exact_emission_supervision_steps
+        / max(exact_emission_target_steps, 1.0),
+        "exact_byte_emission_hit_rate": exact_byte_emission_hits / max(exact_emission_target_steps, 1.0),
+        "exact_span_emission_hit_rate": exact_span_emission_hits / max(exact_emission_target_steps, 1.0),
+        "avg_exact_emission_candidates": exact_emission_candidate_count / max(exact_emission_candidate_steps, 1.0),
         "erm_carryover_hits": sum(
             float(output.memory_stats.get("copy_target_hits", 0.0))
             for window_index, output in enumerate(outputs)

@@ -11,6 +11,7 @@ from htm_code_native.losses.core import (
     autoregressive_loss,
     energy_penalty,
     episodic_pointer_loss,
+    exact_emission_loss,
     graph_copy_loss,
     recent_copy_loss,
     route_consistency_loss,
@@ -63,6 +64,10 @@ def test_smoke_train_step_backward(build_batch, config) -> None:
         batch.targets,
         output.episodic_target_mask,
     )
+    loss = loss + exact_emission_loss(
+        output.exact_emission_candidate_scores,
+        output.exact_emission_target_indices,
+    )
     loss = loss + graph_copy_loss(
         output.graph_logits,
         batch.targets,
@@ -106,10 +111,18 @@ def test_recent_copy_mask_and_logits_are_emitted(build_batch, config) -> None:
     assert bool(output.copy_target_mask.any().item()) is True
     assert output.exact_payload_target_mask is not None
     assert output.exact_span_target_mask is not None
+    assert output.exact_emission_target_mask is not None
+    assert output.exact_emission_candidate_scores is not None
+    assert output.exact_emission_target_indices is not None
+    assert output.exact_emission_predictions is not None
     assert bool(output.exact_payload_target_mask.any().item()) is True
+    assert bool(output.exact_emission_target_mask.any().item()) is True
     assert output.memory_stats["exact_byte_candidate_hits"] > 0
     assert output.memory_stats["exact_span_candidate_hits"] > 0
+    assert output.memory_stats["exact_emission_supervision_steps"] > 0
     assert output.auxiliary["phase_exit_probe_metrics"]["exact_payload_recall"] > 0.0
+    assert output.auxiliary["phase_exit_probe_metrics"]["exact_emission_candidate_coverage"] > 0.0
+    assert output.auxiliary["phase_exit_probe_metrics"]["avg_exact_emission_candidates"] > 0.0
     matching_steps = output.copy_target_mask.nonzero(as_tuple=False).flatten()
     first_step = int(matching_steps[0].item())
     target_id = int(batch.targets[first_step].item())
@@ -128,6 +141,7 @@ def test_eem_outputs_and_chunk_stats_are_emitted(build_batch, config) -> None:
     assert output.pointer_attention is not None
     assert output.memory_stats["exact_episodic_payload_candidates"] > 0
     assert any(output.auxiliary["exact_episodic_payload_candidates"])
+    assert "exact_byte_emission_hit_rate" in output.auxiliary["phase_exit_probe_metrics"]
 
 
 def test_graph_outputs_and_stats_are_emitted(build_batch, config) -> None:
@@ -168,6 +182,10 @@ def test_graph_outputs_and_stats_are_emitted(build_batch, config) -> None:
     assert not output.effective_router_weights.equal(output.router_weights)
     assert output.memory_stats["graph_reads"] > 0
     assert output.memory_stats["graph_candidates"] > 0
+    assert output.memory_stats["graph_candidate_pool_size"] > 0
+    assert output.memory_stats["graph_total_nodes_considered"] >= output.memory_stats["graph_candidate_pool_size"]
+    assert output.memory_stats["graph_pruned_nodes"] > 0
+    assert output.memory_stats["graph_prune_rate"] > 0.0
     assert output.memory_stats["graph_fusion_steps"] > 0
     assert output.memory_stats["avg_energy_proxy"] >= output.memory_stats["always_on_energy"]
     assert output.memory_stats["graph_task_eligible_steps"] < len(batch.document.tokens)

@@ -30,6 +30,7 @@ model:
   graph_test_bias: 1.0
   graph_diagnostic_bias: 1.0
   repo_max_files: 256
+  repo_graph_candidate_budget: 64
   parser_backend: tree-sitter
   supported_languages:
     - python
@@ -86,8 +87,10 @@ model:
   probe_min_cold_read_rate: 0.01
   probe_min_recent_copy_hit_rate: 0.01
   probe_min_episodic_hit_rate: 0.01
+  probe_min_exact_byte_emission_hit_rate: 0.01
   probe_min_symbol_link_hit_rate: 0.01
   probe_min_graph_copy_hit_rate: 0.01
+  probe_min_graph_prune_rate: 0.10
   probe_min_route_entropy: 0.5
   probe_min_patch_candidate_valid_rate: 0.25
   probe_min_best_patch_hit_rate: 0.25
@@ -97,6 +100,7 @@ model:
   edit_span_weight: 0.1
   edit_patch_weight: 0.2
   diagnostic_alignment_weight: 0.1
+  exact_emission_weight: 0.1
   edit_max_candidates: 3
 hssm:
   max_level: 5

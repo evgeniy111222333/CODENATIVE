@@ -272,6 +272,19 @@ class ExactPayloadCandidate:
 
 
 @dataclass(slots=True)
+class ExactEmissionPrediction:
+    step_index: int
+    source: str
+    token_id: int
+    start_byte: int
+    end_byte: int
+    byte_payload: bytes
+    score: float
+    payload_matches_target: bool
+    span_matches_target: bool
+
+
+@dataclass(slots=True)
 class ExactRecentReadResult:
     distribution: torch.Tensor
     log_distribution: torch.Tensor
@@ -437,6 +450,10 @@ class RepoGraphReadResult:
     test_hits: int
     diagnostic_hits: int
     target_node_id: str | None = None
+    candidate_pool_size: int = 0
+    total_node_count: int = 0
+    pruned_node_count: int = 0
+    prune_rate: float = 0.0
 
 
 @dataclass(slots=True)
@@ -519,6 +536,10 @@ class PhaseAOutput:
     graph_copy_target_ids: torch.Tensor | None
     exact_payload_target_mask: torch.Tensor | None
     exact_span_target_mask: torch.Tensor | None
+    exact_emission_target_mask: torch.Tensor | None
+    exact_emission_candidate_scores: list[torch.Tensor] | None
+    exact_emission_target_indices: list[int | None] | None
+    exact_emission_predictions: tuple[ExactEmissionPrediction | None, ...] | None
     base_hidden_states: torch.Tensor | None
     graph_contexts: torch.Tensor | None
     router_weights: torch.Tensor | None

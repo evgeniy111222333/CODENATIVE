@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import torch
 
+from htm_code_native.data.types import ExactPayloadCandidate
 from htm_code_native.data.vocabulary import VocabularyRegistry
+from htm_code_native.losses.core import exact_emission_loss
 from htm_code_native.memory.exact_recent import ExactRecentMemory
+from htm_code_native.model.phase_a import PhaseACodeModel
 
 
 def test_vocabulary_registry_stable_ids_and_unk() -> None:
@@ -77,3 +80,68 @@ def test_exact_recent_repeated_tokens_accumulate_copy_mass() -> None:
         if candidate.token_id == 7
     ]
     assert alpha_payloads == [b"a", b"a"]
+
+
+def test_exact_emission_loss_handles_empty_missing_and_valid_targets() -> None:
+    assert exact_emission_loss([], []).item() == 0.0
+
+    missing_scores = torch.tensor([0.2, 0.8], requires_grad=True)
+    missing_loss = exact_emission_loss([missing_scores], [None])
+    assert missing_loss.device == missing_scores.device
+    assert missing_loss.item() == 0.0
+
+    scores = torch.tensor([0.2, 1.1], requires_grad=True)
+    loss = exact_emission_loss([scores], [1])
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert scores.grad is not None
+
+
+def test_exact_emission_target_index_requires_exact_payload_and_span(config) -> None:
+    model = PhaseACodeModel(config)
+    candidates = (
+        ExactPayloadCandidate(
+            source="exact_recent",
+            token_id=7,
+            start_byte=0,
+            end_byte=5,
+            byte_payload=b"alpha",
+            score=0.9,
+        ),
+        ExactPayloadCandidate(
+            source="exact_recent",
+            token_id=7,
+            start_byte=10,
+            end_byte=15,
+            byte_payload=b"alpha",
+            score=0.1,
+        ),
+        ExactPayloadCandidate(
+            source="exact_episodic",
+            token_id=7,
+            start_byte=10,
+            end_byte=15,
+            byte_payload=b"beta",
+            score=1.0,
+        ),
+    )
+
+    assert (
+        model._exact_emission_target_index(
+            candidates=candidates,
+            target_token_id=7,
+            target_payload=b"alpha",
+            target_span=(10, 15),
+        )
+        == 1
+    )
+    assert (
+        model._exact_emission_target_index(
+            candidates=candidates,
+            target_token_id=7,
+            target_payload=b"gamma",
+            target_span=(20, 25),
+        )
+        is None
+    )

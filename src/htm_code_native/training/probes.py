@@ -68,6 +68,10 @@ def run_phase_exit_probes(
         "exact_span_recall": [],
         "exact_recent_payload_recall": [],
         "exact_episodic_payload_recall": [],
+        "exact_emission_candidate_coverage": [],
+        "exact_byte_emission_hit_rate": [],
+        "exact_span_emission_hit_rate": [],
+        "avg_exact_emission_candidates": [],
         "graph_copy_hit_rate": [],
         "symbol_link_hit_rate": [],
         "route_entropy": [],
@@ -77,6 +81,7 @@ def run_phase_exit_probes(
         "cold_semantic_invocation_rate": [],
         "cold_session_delta_vs_stateless": [],
         "graph_supervision_count": [],
+        "graph_prune_rate": [],
         "definition_use_hit_rate": [],
         "diagnostic_link_hit_rate": [],
         "edit_fix_graph_hit_rate": [],
@@ -156,6 +161,18 @@ def run_phase_exit_probes(
             metrics_accumulator["exact_episodic_payload_recall"].append(
                 float(output.auxiliary["phase_exit_probe_metrics"]["exact_episodic_payload_recall"])
             )
+            metrics_accumulator["exact_emission_candidate_coverage"].append(
+                float(output.auxiliary["phase_exit_probe_metrics"]["exact_emission_candidate_coverage"])
+            )
+            metrics_accumulator["exact_byte_emission_hit_rate"].append(
+                float(output.auxiliary["phase_exit_probe_metrics"]["exact_byte_emission_hit_rate"])
+            )
+            metrics_accumulator["exact_span_emission_hit_rate"].append(
+                float(output.auxiliary["phase_exit_probe_metrics"]["exact_span_emission_hit_rate"])
+            )
+            metrics_accumulator["avg_exact_emission_candidates"].append(
+                float(output.auxiliary["phase_exit_probe_metrics"]["avg_exact_emission_candidates"])
+            )
             metrics_accumulator["graph_copy_hit_rate"].append(
                 float(output.auxiliary["phase_exit_probe_metrics"]["graph_copy_hit_rate"])
             )
@@ -165,6 +182,10 @@ def run_phase_exit_probes(
             metrics_accumulator["graph_supervision_count"].append(
                 float(output.auxiliary["phase_exit_probe_metrics"]["graph_supervision_count"])
             )
+            if float(output.memory_stats.get("graph_total_nodes_considered", 0.0)) > 0.0:
+                metrics_accumulator["graph_prune_rate"].append(
+                    float(output.auxiliary["phase_exit_probe_metrics"]["graph_prune_rate"])
+                )
             metrics_accumulator["definition_use_hit_rate"].append(
                 float(output.auxiliary["phase_exit_probe_metrics"]["definition_use_hit_rate"])
             )
@@ -244,6 +265,8 @@ def run_phase_exit_probes(
     if phase in {TrainingPhase.PHASE_B, TrainingPhase.PHASE_C, TrainingPhase.PHASE_D, TrainingPhase.PHASE_E}:
         if aggregate_metrics["recent_copy_hit_rate"] < config.model.probe_min_recent_copy_hit_rate:
             failing_checks.append("recent_copy_below_threshold")
+        if aggregate_metrics["exact_byte_emission_hit_rate"] < config.model.probe_min_exact_byte_emission_hit_rate:
+            failing_checks.append("exact_byte_emission_below_threshold")
         if aggregate_metrics["cold_read_rate"] < config.model.probe_min_cold_read_rate:
             failing_checks.append("cold_read_below_threshold")
     if phase in {TrainingPhase.PHASE_C, TrainingPhase.PHASE_D, TrainingPhase.PHASE_E}:
@@ -254,6 +277,8 @@ def run_phase_exit_probes(
             failing_checks.append("symbol_link_below_threshold")
         if aggregate_metrics["graph_copy_hit_rate"] < config.model.probe_min_graph_copy_hit_rate:
             failing_checks.append("graph_copy_below_threshold")
+        if aggregate_metrics["graph_prune_rate"] < config.model.probe_min_graph_prune_rate:
+            failing_checks.append("graph_prune_below_threshold")
     if phase == TrainingPhase.PHASE_E:
         if aggregate_metrics["route_entropy"] < config.model.probe_min_route_entropy:
             failing_checks.append("route_entropy_below_threshold")

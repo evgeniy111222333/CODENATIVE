@@ -15,9 +15,13 @@ from htm_code_native.losses.core import (
     autoregressive_loss,
     cap_auxiliary_losses,
     definition_use_loss,
+    diagnostic_alignment_loss,
     diagnostic_probe_loss,
     energy_penalty,
     episodic_pointer_loss,
+    edit_patch_loss,
+    edit_span_loss,
+    exact_emission_loss,
     graph_copy_loss,
     hierarchical_consistency_loss,
     masked_autoregressive_loss,
@@ -88,6 +92,10 @@ def phase_loss_scales(phase: TrainingPhase) -> dict[str, float]:
             "oracle": 0.0,
             "entropy": 0.0,
             "energy": 0.0,
+            "edit_span": 0.0,
+            "edit_patch": 0.0,
+            "diagnostic_alignment": 0.0,
+            "exact_emission": 0.0,
         }
     if phase == TrainingPhase.PHASE_B:
         return {
@@ -102,6 +110,10 @@ def phase_loss_scales(phase: TrainingPhase) -> dict[str, float]:
             "oracle": 1.0,
             "entropy": 1.0,
             "energy": 1.0,
+            "edit_span": 0.0,
+            "edit_patch": 0.0,
+            "diagnostic_alignment": 0.0,
+            "exact_emission": 1.0,
         }
     if phase == TrainingPhase.PHASE_C:
         return {
@@ -116,6 +128,10 @@ def phase_loss_scales(phase: TrainingPhase) -> dict[str, float]:
             "oracle": 1.0,
             "entropy": 1.0,
             "energy": 1.0,
+            "edit_span": 0.0,
+            "edit_patch": 0.0,
+            "diagnostic_alignment": 0.0,
+            "exact_emission": 1.0,
         }
     if phase == TrainingPhase.PHASE_D:
         return {
@@ -130,6 +146,10 @@ def phase_loss_scales(phase: TrainingPhase) -> dict[str, float]:
             "oracle": 1.0,
             "entropy": 1.0,
             "energy": 1.0,
+            "edit_span": 0.0,
+            "edit_patch": 0.0,
+            "diagnostic_alignment": 0.0,
+            "exact_emission": 1.0,
         }
     return {
         "copy_r": 1.0,
@@ -143,6 +163,10 @@ def phase_loss_scales(phase: TrainingPhase) -> dict[str, float]:
         "oracle": 0.0,
         "entropy": 0.0,
         "energy": 1.0,
+        "edit_span": 1.0,
+        "edit_patch": 1.0,
+        "diagnostic_alignment": 1.0,
+        "exact_emission": 1.0,
     }
 
 
@@ -538,6 +562,32 @@ def command_smoke_train(args: argparse.Namespace) -> int:
             output.energy_proxy,
             output.memory_stats["always_on_energy"],
         )
+        exact_emission_l = exact_emission_loss(
+            output.exact_emission_candidate_scores,
+            output.exact_emission_target_indices,
+        )
+        zero_edit_loss = output.logits.new_tensor(0.0)
+        if example.task_label == TaskLabel.EDIT_FIX:
+            edit_target_token_mask = task_batch.metadata.get("edit_target_token_mask")
+            diagnostic_token_mask = task_batch.metadata.get("diagnostic_token_mask")
+            edit_span_l = edit_span_loss(
+                output.auxiliary.get("edit_token_scores"),
+                edit_target_token_mask,
+            )
+            edit_patch_l = edit_patch_loss(
+                output.logits,
+                task_batch.batch.targets,
+                task_batch.supervision_mask,
+            )
+            diagnostic_alignment_l = diagnostic_alignment_loss(
+                output.auxiliary.get("edit_token_scores"),
+                edit_target_token_mask,
+                diagnostic_token_mask,
+            )
+        else:
+            edit_span_l = zero_edit_loss
+            edit_patch_l = zero_edit_loss
+            diagnostic_alignment_l = zero_edit_loss
 
         probe_kind = example.metadata.get("probe_kind")
         weighted_aux_losses = {
@@ -552,6 +602,18 @@ def command_smoke_train(args: argparse.Namespace) -> int:
             "oracle": loss_scales["oracle"] * config.model.route_weight * oracle_loss,
             "entropy": loss_scales["entropy"] * config.model.router_entropy_floor_weight * entropy_floor_loss,
             "energy": loss_scales["energy"] * config.model.energy_weight * energy_loss,
+            "edit_span": loss_scales["edit_span"] * config.model.edit_span_weight * edit_span_l,
+            "edit_patch": loss_scales["edit_patch"] * config.model.edit_patch_weight * edit_patch_l,
+            "diagnostic_alignment": (
+                loss_scales["diagnostic_alignment"]
+                * config.model.diagnostic_alignment_weight
+                * diagnostic_alignment_l
+            ),
+            "exact_emission": (
+                loss_scales["exact_emission"]
+                * config.model.exact_emission_weight
+                * exact_emission_l
+            ),
         }
         if probe_kind == "definition_use":
             weighted_aux_losses["diagnostic"] = weighted_aux_losses["diagnostic"] * 0.0
@@ -562,6 +624,12 @@ def command_smoke_train(args: argparse.Namespace) -> int:
             weighted_aux_losses,
             config.model.auxiliary_cap_ratio,
         )
+        edit_aux_loss = (
+            capped_aux_losses.get("edit_span", zero_edit_loss)
+            + capped_aux_losses.get("edit_patch", zero_edit_loss)
+            + capped_aux_losses.get("diagnostic_alignment", zero_edit_loss)
+        )
+        exact_emission_aux_loss = capped_aux_losses.get("exact_emission", output.logits.new_tensor(0.0))
 
         total_loss = ar_loss + (0.2 * hier_loss) + (0.01 * sparse_loss) + sum(capped_aux_losses.values())
         total_loss.backward()
@@ -595,6 +663,12 @@ def command_smoke_train(args: argparse.Namespace) -> int:
                     "router_oracle_loss": float(oracle_loss.item()),
                     "router_entropy_floor_loss": float(entropy_floor_loss.item()),
                     "energy_loss": float(energy_loss.item()),
+                    "edit_span_loss": float(edit_span_l.item()),
+                    "edit_patch_loss": float(edit_patch_l.item()),
+                    "diagnostic_alignment_loss": float(diagnostic_alignment_l.item()),
+                    "edit_aux_loss": float(edit_aux_loss.item()),
+                    "exact_emission_loss": float(exact_emission_l.item()),
+                    "exact_emission_aux_loss": float(exact_emission_aux_loss.item()),
                     "maintenance_decision": {
                         "should_consolidate": maintenance_decision.should_consolidate,
                         "reason": maintenance_decision.reason,

@@ -72,6 +72,30 @@ def episodic_pointer_loss(
     return F.nll_loss(eem_logits[episodic_target_mask], targets[episodic_target_mask])
 
 
+def exact_emission_loss(
+    candidate_scores: list[torch.Tensor] | None,
+    target_indices: list[int | None] | None,
+) -> torch.Tensor:
+    if not candidate_scores or not target_indices:
+        return torch.tensor(0.0)
+    losses: list[torch.Tensor] = []
+    device = candidate_scores[0].device if candidate_scores else None
+    for scores, target_index in zip(candidate_scores, target_indices, strict=False):
+        if target_index is None or scores.numel() == 0:
+            continue
+        if target_index < 0 or target_index >= int(scores.shape[0]):
+            continue
+        losses.append(
+            F.cross_entropy(
+                scores.unsqueeze(0),
+                torch.tensor([target_index], dtype=torch.long, device=scores.device),
+            )
+        )
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
 def graph_copy_loss(
     graph_logits: torch.Tensor | None,
     targets: torch.Tensor,

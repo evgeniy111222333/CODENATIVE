@@ -63,6 +63,7 @@ class PhaseAModelConfig:
     graph_test_bias: float = 1.0
     graph_diagnostic_bias: float = 1.0
     repo_max_files: int = 256
+    repo_graph_candidate_budget: int = 64
     parser_backend: str = "tree-sitter"
     supported_languages: list[str] = field(
         default_factory=lambda: ["python", "javascript", "typescript", "json", "yaml", "toml", "ini"]
@@ -114,8 +115,10 @@ class PhaseAModelConfig:
     probe_min_cold_read_rate: float = 0.01
     probe_min_recent_copy_hit_rate: float = 0.01
     probe_min_episodic_hit_rate: float = 0.01
+    probe_min_exact_byte_emission_hit_rate: float = 0.01
     probe_min_symbol_link_hit_rate: float = 0.01
     probe_min_graph_copy_hit_rate: float = 0.01
+    probe_min_graph_prune_rate: float = 0.10
     probe_min_route_entropy: float = 0.5
     probe_min_patch_candidate_valid_rate: float = 0.25
     probe_min_best_patch_hit_rate: float = 0.25
@@ -125,6 +128,7 @@ class PhaseAModelConfig:
     edit_span_weight: float = 0.1
     edit_patch_weight: float = 0.2
     diagnostic_alignment_weight: float = 0.1
+    exact_emission_weight: float = 0.1
     edit_max_candidates: int = 3
 
 

@@ -11,6 +11,7 @@ from torch import nn
 from htm_code_native.config.settings import HTMCodeNativeConfig
 from htm_code_native.data.types import (
     ExactEpisodicReadResult,
+    ExactEmissionPrediction,
     ExactPayloadCandidate,
     ExactRecentReadResult,
     HSSMState,
@@ -77,6 +78,7 @@ class PhaseACodeModel(nn.Module):
             symbol_bias=config.model.graph_symbol_bias,
             test_bias=config.model.graph_test_bias,
             diagnostic_bias=config.model.graph_diagnostic_bias,
+            candidate_budget=config.model.repo_graph_candidate_budget,
             value_dim=config.model.graph_value_dim,
         )
         self.router = TwoStageRouter(
@@ -130,6 +132,15 @@ class PhaseACodeModel(nn.Module):
             nn.Linear(hidden_size * 2, hidden_size),
         )
         self.edit_span_head = nn.Linear(hidden_size + config.model.graph_value_dim, 1)
+        exact_emission_feature_dim = (hidden_size * 2) + 4
+        self.exact_emission_scorer = nn.Sequential(
+            nn.LayerNorm(exact_emission_feature_dim),
+            nn.Linear(exact_emission_feature_dim, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, 1),
+        )
+        nn.init.zeros_(self.exact_emission_scorer[-1].weight)
+        nn.init.zeros_(self.exact_emission_scorer[-1].bias)
         self.vocab_head = nn.Linear(hidden_size, config.model.vocabulary_size)
         self.semantic_head = (
             nn.Linear(hidden_size, config.model.vocabulary_size)
@@ -236,6 +247,7 @@ class PhaseACodeModel(nn.Module):
         graph_copy_target_ids = torch.full((seq_len,), fill_value=-1, dtype=torch.long, device=device)
         exact_payload_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         exact_span_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        exact_emission_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         graph_supervision_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         entropy_tensor = torch.zeros(seq_len, num_levels, device=device)
         lane_entropies = torch.zeros(seq_len, 5, device=device)
@@ -265,12 +277,21 @@ class PhaseACodeModel(nn.Module):
         exact_episodic_payload_hits = 0
         exact_recent_payload_candidates = 0
         exact_episodic_payload_candidates = 0
+        exact_emission_target_steps = 0
+        exact_emission_supervision_steps = 0
+        exact_emission_candidate_steps = 0
+        exact_emission_candidate_count = 0
+        exact_byte_emission_hits = 0
+        exact_span_emission_hits = 0
         total_eem_reads = 0
         total_chunks_finalized = 0
         total_chunk_overhead = 0.0
         episodic_target_hits = 0
         total_graph_reads = 0
         total_graph_candidates = 0
+        total_graph_candidate_pool_size = 0
+        total_graph_total_nodes = 0
+        total_graph_pruned_nodes = 0
         total_graph_samefile_hits = 0
         total_graph_import_hits = 0
         total_graph_symbol_hits = 0
@@ -314,6 +335,9 @@ class PhaseACodeModel(nn.Module):
         exact_recent_payload_candidates_by_step: list[tuple[ExactPayloadCandidate, ...]] = []
         exact_episodic_payload_candidates_by_step: list[tuple[ExactPayloadCandidate, ...]] = []
         exact_payload_target_bytes: list[bytes | None] = []
+        exact_emission_candidate_scores: list[torch.Tensor] = []
+        exact_emission_target_indices: list[int | None] = []
+        exact_emission_predictions: list[ExactEmissionPrediction | None] = []
         route_teacher_indices: list[int] = []
         route_teacher_expensive: list[tuple[int, int, int]] = []
         router_pre_logits: list[torch.Tensor] = []
@@ -492,6 +516,19 @@ class PhaseACodeModel(nn.Module):
             exact_episodic_payload_candidates_by_step.append(exact_episodic_result.payload_candidates)
             exact_recent_payload_candidates += len(exact_recent_result.payload_candidates)
             exact_episodic_payload_candidates += len(exact_episodic_result.payload_candidates)
+            exact_candidates = (
+                *exact_recent_result.payload_candidates,
+                *exact_episodic_result.payload_candidates,
+            )
+            step_exact_emission_scores = self._score_exact_emission_candidates(
+                hidden,
+                exact_candidates,
+                batch=batch,
+                step=step,
+            )
+            exact_emission_candidate_scores.append(step_exact_emission_scores)
+            exact_emission_candidate_count += len(exact_candidates)
+            exact_emission_candidate_steps += int(bool(exact_candidates))
 
             graph_logits[step] = graph_result.log_distribution
             graph_attention[step] = graph_result.attention
@@ -501,6 +538,9 @@ class PhaseACodeModel(nn.Module):
             graph_candidate_scores.append(graph_result.candidate_scores)
             total_graph_reads += graph_result.read_count
             total_graph_candidates += graph_result.candidate_count
+            total_graph_candidate_pool_size += graph_result.candidate_pool_size
+            total_graph_total_nodes += graph_result.total_node_count
+            total_graph_pruned_nodes += graph_result.pruned_node_count
             total_graph_samefile_hits += graph_result.samefile_hits
             total_graph_import_hits += graph_result.import_hits
             total_graph_symbol_hits += graph_result.symbol_hits
@@ -556,12 +596,16 @@ class PhaseACodeModel(nn.Module):
             graph_supervision_mode = "none"
             graph_target_present = False
             graph_copy_present = False
+            exact_emission_target_index = None
+            exact_emission_prediction = None
             if step < seq_len - 1:
                 target_token_id = int(batch.targets[step].item())
                 target_payload = self._target_payload_bytes(batch, step + 1)
+                target_span = self._target_payload_span(batch, step + 1)
                 exact_payload_target_bytes.append(target_payload)
                 if target_payload:
                     exact_payload_candidate_steps += 1
+                    exact_emission_target_steps += 1
                     payload_metrics = self._exact_payload_candidate_metrics(
                         target_token_id=target_token_id,
                         target_payload=target_payload,
@@ -570,6 +614,26 @@ class PhaseACodeModel(nn.Module):
                             *exact_episodic_result.payload_candidates,
                         ),
                     )
+                    exact_emission_target_index = self._exact_emission_target_index(
+                        candidates=exact_candidates,
+                        target_token_id=target_token_id,
+                        target_payload=target_payload,
+                        target_span=target_span,
+                    )
+                    if exact_emission_target_index is not None:
+                        exact_emission_target_mask[step] = True
+                        exact_emission_supervision_steps += 1
+                    exact_emission_prediction = self._exact_emission_prediction(
+                        step_index=step,
+                        candidates=exact_candidates,
+                        candidate_scores=step_exact_emission_scores,
+                        target_token_id=target_token_id,
+                        target_payload=target_payload,
+                        target_span=target_span,
+                    )
+                    if exact_emission_prediction is not None:
+                        exact_byte_emission_hits += int(exact_emission_prediction.payload_matches_target)
+                        exact_span_emission_hits += int(exact_emission_prediction.span_matches_target)
                     if payload_metrics["payload_hit"]:
                         exact_payload_target_mask[step] = True
                         exact_byte_candidate_hits += 1
@@ -655,6 +719,8 @@ class PhaseACodeModel(nn.Module):
                 route_teacher_indices.append(0)
                 route_teacher_expensive.append((0, 0, 0))
                 graph_copy_target_mask[step] = False
+            exact_emission_target_indices.append(exact_emission_target_index)
+            exact_emission_predictions.append(exact_emission_prediction)
 
             post_logits, learned_weights, post_mask = self.router.route_post(
                 post_router_features,
@@ -790,6 +856,11 @@ class PhaseACodeModel(nn.Module):
         ) / max(self.config.hssm.num_levels, 1)
         semantic_cold_cluster_count = self._semantic_cold_cluster_count()
         cold_clusters_created = max(0, semantic_cold_cluster_count - initial_cold_cluster_count)
+        graph_prune_rate = total_graph_pruned_nodes / max(total_graph_total_nodes, 1)
+        exact_emission_candidate_coverage = exact_emission_supervision_steps / max(exact_emission_target_steps, 1)
+        exact_byte_emission_hit_rate = exact_byte_emission_hits / max(exact_emission_target_steps, 1)
+        exact_span_emission_hit_rate = exact_span_emission_hits / max(exact_emission_target_steps, 1)
+        avg_exact_emission_candidates = exact_emission_candidate_count / max(exact_emission_candidate_steps, 1)
         memory_stats = {
             "hot_reads": float(total_hot_reads),
             "cold_reads": float(total_cold_reads),
@@ -810,6 +881,12 @@ class PhaseACodeModel(nn.Module):
             "exact_episodic_payload_hits": float(exact_episodic_payload_hits),
             "exact_recent_payload_candidates": float(exact_recent_payload_candidates),
             "exact_episodic_payload_candidates": float(exact_episodic_payload_candidates),
+            "exact_emission_target_steps": float(exact_emission_target_steps),
+            "exact_emission_supervision_steps": float(exact_emission_supervision_steps),
+            "exact_emission_candidate_steps": float(exact_emission_candidate_steps),
+            "exact_emission_candidate_count": float(exact_emission_candidate_count),
+            "exact_byte_emission_hits": float(exact_byte_emission_hits),
+            "exact_span_emission_hits": float(exact_span_emission_hits),
             "eem_reads": float(total_eem_reads),
             "chunks_finalized": float(total_chunks_finalized),
             "stored_chunks": float(len(self.exact_episodic_memory.chunks)),
@@ -817,6 +894,10 @@ class PhaseACodeModel(nn.Module):
             "episodic_target_hits": float(episodic_target_hits),
             "graph_reads": float(total_graph_reads),
             "graph_candidates": float(total_graph_candidates),
+            "graph_candidate_pool_size": float(total_graph_candidate_pool_size),
+            "graph_total_nodes_considered": float(total_graph_total_nodes),
+            "graph_pruned_nodes": float(total_graph_pruned_nodes),
+            "graph_prune_rate": float(graph_prune_rate),
             "graph_copy_hits": float(graph_copy_hits),
             "graph_copy_supervision_steps": float(graph_copy_supervision_steps),
             "graph_samefile_hits": float(total_graph_samefile_hits),
@@ -861,9 +942,14 @@ class PhaseACodeModel(nn.Module):
             "exact_span_recall": float(exact_span_candidate_hits / max(exact_payload_candidate_steps, 1)),
             "exact_recent_payload_recall": float(exact_recent_payload_hits / max(exact_payload_candidate_steps, 1)),
             "exact_episodic_payload_recall": float(exact_episodic_payload_hits / max(exact_payload_candidate_steps, 1)),
+            "exact_emission_candidate_coverage": float(exact_emission_candidate_coverage),
+            "exact_byte_emission_hit_rate": float(exact_byte_emission_hit_rate),
+            "exact_span_emission_hit_rate": float(exact_span_emission_hit_rate),
+            "avg_exact_emission_candidates": float(avg_exact_emission_candidates),
             "graph_copy_hit_rate": float(graph_copy_hits / max(graph_copy_supervision_steps, 1)),
             "symbol_link_hit_rate": float(symbol_link_hits / max(graph_supervision_steps, 1)),
             "graph_supervision_count": float(graph_supervision_steps),
+            "graph_prune_rate": float(graph_prune_rate),
             "definition_use_hit_rate": float(definition_use_hits / max(definition_use_steps, 1)),
             "diagnostic_link_hit_rate": float(diagnostic_link_hits / max(diagnostic_supervision_steps, 1)),
             "edit_fix_graph_hit_rate": float(edit_fix_graph_hits / max(edit_fix_supervision_steps, 1)),
@@ -907,6 +993,10 @@ class PhaseACodeModel(nn.Module):
             graph_copy_target_ids=graph_copy_target_ids,
             exact_payload_target_mask=exact_payload_target_mask,
             exact_span_target_mask=exact_span_target_mask,
+            exact_emission_target_mask=exact_emission_target_mask,
+            exact_emission_candidate_scores=exact_emission_candidate_scores,
+            exact_emission_target_indices=exact_emission_target_indices,
+            exact_emission_predictions=tuple(exact_emission_predictions),
             base_hidden_states=base_hidden_states,
             graph_contexts=graph_contexts,
             router_weights=router_weights,
@@ -943,6 +1033,9 @@ class PhaseACodeModel(nn.Module):
                 "exact_recent_payload_candidates": exact_recent_payload_candidates_by_step,
                 "exact_episodic_payload_candidates": exact_episodic_payload_candidates_by_step,
                 "exact_payload_target_bytes": exact_payload_target_bytes,
+                "exact_emission_candidate_scores": exact_emission_candidate_scores,
+                "exact_emission_target_indices": exact_emission_target_indices,
+                "exact_emission_predictions": tuple(exact_emission_predictions),
                 "graph_supervision_mask": graph_supervision_mask,
                 "graph_supervision_mode": graph_supervision_modes,
                 "graph_supervision_count": float(graph_supervision_steps),
@@ -1414,6 +1507,158 @@ class PhaseACodeModel(nn.Module):
             return None
         text = str(value).strip()
         return text or None
+
+    def _score_exact_emission_candidates(
+        self,
+        hidden: torch.Tensor,
+        candidates: tuple[ExactPayloadCandidate, ...],
+        *,
+        batch: PhaseABatch,
+        step: int,
+    ) -> torch.Tensor:
+        if not candidates:
+            return hidden.new_empty((0,))
+        device = hidden.device
+        vocab_limit = self.config.model.vocabulary_size - 1
+        token_ids = torch.tensor(
+            [min(max(candidate.token_id, 0), vocab_limit) for candidate in candidates],
+            dtype=torch.long,
+            device=device,
+        )
+        token_embeddings = self.encoder.token_embedding(token_ids)
+        source_features = torch.tensor(
+            [
+                [
+                    1.0 if candidate.source == "exact_recent" else 0.0,
+                    1.0 if candidate.source == "exact_episodic" else 0.0,
+                    len(candidate.byte_payload) / max(float(self.config.model.max_recent_byte_payload), 1.0),
+                    max(candidate.end_byte - candidate.start_byte, 0)
+                    / max(float(self.config.model.max_recent_byte_payload), 1.0),
+                ]
+                for candidate in candidates
+            ],
+            dtype=hidden.dtype,
+            device=device,
+        )
+        hidden_features = hidden.unsqueeze(0).expand(len(candidates), -1)
+        learned_delta = self.exact_emission_scorer(
+            torch.cat([hidden_features, token_embeddings, source_features], dim=-1)
+        ).squeeze(-1)
+        base_scores = torch.tensor(
+            [candidate.score for candidate in candidates],
+            dtype=hidden.dtype,
+            device=device,
+        )
+        transition_scores = torch.tensor(
+            [
+                self._exact_emission_transition_bonus(batch, step, candidate)
+                for candidate in candidates
+            ],
+            dtype=hidden.dtype,
+            device=device,
+        )
+        return base_scores + transition_scores + learned_delta
+
+    def _exact_emission_transition_bonus(
+        self,
+        batch: PhaseABatch,
+        step: int,
+        candidate: ExactPayloadCandidate,
+    ) -> float:
+        source_index = self._token_index_for_byte(batch, candidate.start_byte)
+        if source_index is None:
+            return 0.0
+        bonus = 0.05 if candidate.source == "exact_recent" else 0.0
+        if source_index == step:
+            bonus -= 0.25
+        if 0 <= source_index < step:
+            bonus += 0.1 * (source_index / max(float(step), 1.0))
+        previous_index = source_index - 1
+        if previous_index < 0 or step < 0 or step >= len(batch.document.tokens):
+            return bonus
+        current_payload = self._target_payload_bytes(batch, step)
+        previous_payload = self._target_payload_bytes(batch, previous_index)
+        if current_payload and previous_payload and current_payload == previous_payload:
+            bonus += 2.0
+        if int(batch.token_ids[previous_index].item()) == int(batch.token_ids[step].item()):
+            bonus += 1.0
+        return bonus
+
+    def _token_index_for_byte(self, batch: PhaseABatch, byte_offset: int) -> int | None:
+        if byte_offset < 0 or byte_offset >= len(batch.document.byte_to_token_index):
+            return None
+        token_index = batch.document.byte_to_token_index[byte_offset]
+        if token_index < 0 or token_index >= len(batch.document.tokens):
+            return None
+        return int(token_index)
+
+    def _target_payload_span(self, batch: PhaseABatch, target_index: int) -> tuple[int, int]:
+        if target_index < 0 or target_index >= int(batch.token_spans.shape[0]):
+            return (-1, -1)
+        start_byte, end_byte = batch.token_spans[target_index].tolist()
+        return (int(start_byte), int(end_byte))
+
+    def _exact_emission_target_index(
+        self,
+        *,
+        candidates: tuple[ExactPayloadCandidate, ...],
+        target_token_id: int,
+        target_payload: bytes,
+        target_span: tuple[int, int],
+    ) -> int | None:
+        matching_indices = [
+            index
+            for index, candidate in enumerate(candidates)
+            if candidate.token_id == target_token_id
+            and candidate.byte_payload == target_payload
+            and candidate.start_byte == target_span[0]
+            and candidate.end_byte == target_span[1]
+        ]
+        if matching_indices:
+            return max(matching_indices, key=lambda index: candidates[index].score)
+        matching_payload_indices = [
+            index
+            for index, candidate in enumerate(candidates)
+            if candidate.token_id == target_token_id
+            and candidate.byte_payload == target_payload
+            and candidate.start_byte >= 0
+            and candidate.end_byte > candidate.start_byte
+        ]
+        if not matching_payload_indices:
+            return None
+        return max(matching_payload_indices, key=lambda index: candidates[index].score)
+
+    def _exact_emission_prediction(
+        self,
+        *,
+        step_index: int,
+        candidates: tuple[ExactPayloadCandidate, ...],
+        candidate_scores: torch.Tensor,
+        target_token_id: int,
+        target_payload: bytes,
+        target_span: tuple[int, int],
+    ) -> ExactEmissionPrediction | None:
+        if not candidates or candidate_scores.numel() == 0:
+            return None
+        best_index = int(torch.argmax(candidate_scores.detach()).item())
+        candidate = candidates[best_index]
+        payload_matches = candidate.token_id == target_token_id and candidate.byte_payload == target_payload
+        span_matches = (
+            payload_matches
+            and candidate.start_byte >= 0
+            and candidate.end_byte > candidate.start_byte
+        )
+        return ExactEmissionPrediction(
+            step_index=step_index,
+            source=candidate.source,
+            token_id=candidate.token_id,
+            start_byte=candidate.start_byte,
+            end_byte=candidate.end_byte,
+            byte_payload=candidate.byte_payload,
+            score=float(candidate_scores[best_index].detach().item()),
+            payload_matches_target=payload_matches,
+            span_matches_target=span_matches,
+        )
 
     def _target_payload_bytes(self, batch: PhaseABatch, target_index: int) -> bytes:
         if target_index < 0 or target_index >= len(batch.document.tokens):
