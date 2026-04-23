@@ -254,6 +254,13 @@ def _rank_edit_spans(
             or _token_has_graph_match(token.index, graph_candidate_names, graph_candidate_ids, graph_index, target_symbol)
         ):
             continue
+        reasons = ["token_match"]
+        if target_symbol is not None and token_value == target_symbol.strip("\"'"):
+            reasons.append("task_target")
+        if {"import_statement", "import_from_statement"}.intersection(
+            document.token_structures[token.index].ast_path
+        ):
+            reasons.append("import_context")
         span = _make_span_candidate(
             document=document,
             token_start=token.index,
@@ -269,7 +276,7 @@ def _rank_edit_spans(
             graph_candidate_names=graph_candidate_names,
             instruction_terms=instruction_terms,
             diagnostic_terms=diagnostic_terms,
-            reasons=["token_match"],
+            reasons=reasons,
             graph_index=graph_index,
         )
         _update_best_span(span_map, span)
@@ -311,13 +318,18 @@ def _make_span_candidate(
     for step in range(token_start, token_end):
         if graph_candidate_scores[step].numel() > 0:
             span_graph_support += float(torch.softmax(graph_candidate_scores[step], dim=0).max().item())
-        step_terms = {
-            *graph_candidate_names[step],
-            *(
+        candidate_terms = (
+            [
                 term
                 for candidate_id in graph_candidate_ids[step]
                 for term in graph_index.nodes_by_id.get(candidate_id, graph_index.nodes[0]).copy_terms
-            ) if graph_index.nodes else (),
+            ]
+            if graph_index.nodes
+            else []
+        )
+        step_terms = {
+            *graph_candidate_names[step],
+            *candidate_terms,
         }
         if diagnostic_terms.intersection(step_terms):
             span_reasons.add("diagnostic_support")
@@ -334,6 +346,10 @@ def _make_span_candidate(
     score += 0.2 * span_graph_support / max(token_end - token_start, 1)
     if symbol_name is not None:
         score += 0.2
+    if "task_target" in span_reasons:
+        score += 1.25
+    if "import_context" in span_reasons:
+        score -= 0.5
     if "diagnostic_support" in span_reasons:
         score += 0.6
     if "instruction_support" in span_reasons:

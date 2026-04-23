@@ -6,7 +6,7 @@ from typing import Protocol
 import torch
 from torch import nn
 
-from htm_code_native.data.types import RouterDecision, RouterFeatures, TrainingPhase
+from htm_code_native.data.types import RouterDecision, RouterFeatures, RouterRuntimeState, TrainingPhase
 
 
 PRE_LANE_NAMES = ("lm", "semantic_hot", "erm", "semantic_cold", "eem", "graph")
@@ -85,9 +85,24 @@ class TwoStageRouter(nn.Module):
             nn.Linear(post_hidden_dim, len(POST_LANE_NAMES)),
         )
 
+    def init_state(self) -> RouterRuntimeState:
+        return RouterRuntimeState(
+            dominant_mass_history=(),
+            recovery_steps_remaining=0,
+        )
+
     def reset(self) -> None:
-        self._dominant_mass_history.clear()
-        self._recovery_steps_remaining = 0
+        self.load_state(self.init_state())
+
+    def load_state(self, state: RouterRuntimeState) -> None:
+        self._dominant_mass_history = list(state.dominant_mass_history)
+        self._recovery_steps_remaining = state.recovery_steps_remaining
+
+    def export_state(self) -> RouterRuntimeState:
+        return RouterRuntimeState(
+            dominant_mass_history=tuple(self._dominant_mass_history),
+            recovery_steps_remaining=self._recovery_steps_remaining,
+        )
 
     def route(self, features: RouterFeatures) -> RouterDecision:
         pre_logits, expensive_probs, pre_mask, energy_proxy, always_on_energy = self.route_pre(features)

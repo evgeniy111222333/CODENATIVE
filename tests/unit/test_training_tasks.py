@@ -30,6 +30,18 @@ def test_repo_graph_examples_include_probe_kinds() -> None:
     assert {"definition_use", "diagnostic_to_symbol", "edit_fix"} <= probe_kinds
 
 
+def test_edit_fix_replacement_is_in_batch_vocabulary_snapshot(config) -> None:
+    examples = default_task_examples()
+    edit_example = examples[TaskLabel.EDIT_FIX][0]
+    task_batch = build_task_batch(edit_example, config)
+
+    assert task_batch.replacement_text is not None
+    replacement_id = task_batch.batch.vocabulary_snapshot.lookup_token(task_batch.replacement_text)
+    assert replacement_id is not None
+    assert replacement_id == task_batch.batch.task_metadata["replacement_token_id"]
+    assert task_batch.batch.registry_size == task_batch.batch.vocabulary_snapshot.size
+
+
 def test_task_label_fallback_heuristics_still_work() -> None:
     assert infer_task_label("tests/fixtures/recent_copy_module.py") == TaskLabel.RECENT_COPY
     assert infer_task_label("tests/fixtures/episodic_copy_module.py") == TaskLabel.EPISODIC_RECALL

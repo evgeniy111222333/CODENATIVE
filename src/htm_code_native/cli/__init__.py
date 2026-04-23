@@ -400,6 +400,7 @@ def command_smoke_train(args: argparse.Namespace) -> int:
             output.graph_logits,
             task_batch.batch.targets,
             output.graph_copy_target_mask,
+            output.graph_copy_target_ids,
         )
         sym_loss = symbol_link_loss(
             output.auxiliary["graph_candidate_scores"],

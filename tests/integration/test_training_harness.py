@@ -54,7 +54,47 @@ def test_phase_exit_probes_report(config) -> None:
     assert report.phase == TrainingPhase.PHASE_D.value
     assert report.probe_set == "default"
     assert "tokens_per_sec" in report.metrics
+    assert "graph_copy_hit_rate" in report.metrics
+    assert "definition_use_graph_copy_hit_rate" in report.metrics
     assert report.example_count == 2
+
+
+def test_phase_d_probes_prioritize_graph_examples_for_short_runs(config) -> None:
+    model = PhaseACodeModel(config)
+    report = run_phase_exit_probes(
+        model,
+        build_probe_examples(
+            "default",
+            repo_root=str(REPO_GRAPH_ROOT),
+            report_paths=REPO_GRAPH_REPORTS,
+        ),
+        config,
+        TrainingPhase.PHASE_D,
+        probe_set="default",
+        max_steps=3,
+    )
+    assert report.metrics["graph_supervision_count"] > 0.0
+    assert report.metrics["graph_copy_hit_rate"] > 0.0
+
+
+def test_phase_e_probes_include_planner_metrics(config) -> None:
+    model = PhaseACodeModel(config)
+    report = run_phase_exit_probes(
+        model,
+        build_probe_examples(
+            "default",
+            repo_root=str(REPO_GRAPH_ROOT),
+            report_paths=REPO_GRAPH_REPORTS,
+        ),
+        config,
+        TrainingPhase.PHASE_E,
+        probe_set="default",
+        max_steps=3,
+    )
+    assert "patch_candidate_valid_rate" in report.metrics
+    assert "best_patch_hit_rate" in report.metrics
+    assert "diagnostic_to_span_recall" in report.metrics
+    assert "edit_fix_copy_hit_rate" in report.metrics
 
 
 def test_cli_eval_only_phase_report() -> None:

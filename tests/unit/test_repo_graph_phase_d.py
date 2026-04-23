@@ -72,6 +72,7 @@ def test_repo_graph_query_returns_bias_hits_and_copy_support() -> None:
 
     registry = VocabularyRegistry(config.model.vocabulary_size)
     target_identifier = registry.encode_token("GRAPH_SHARED_NAME")
+    quoted_shared_token = registry.encode_token('"shared_graph_token"')
     registry.encode_token("shared_graph_token")
     registry.encode_token("repo_graph_service")
 
@@ -94,7 +95,57 @@ def test_repo_graph_query_returns_bias_hits_and_copy_support() -> None:
     assert result.diagnostic_hits > 0
     assert "function" in result.candidate_kinds or "symbol" in result.candidate_kinds
     assert target_identifier in result.copy_token_ids.tolist()
+    assert quoted_shared_token in result.copy_token_ids.tolist()
     assert result.distribution[target_identifier].item() > 0.0
+    assert result.distribution[quoted_shared_token].item() > 0.0
     assert result.candidate_scores.numel() == result.retrieved_count
     assert result.candidate_scores.requires_grad is True
     assert result.target_node_id is not None
+
+
+def test_repo_graph_query_prefers_explicit_symbol_target() -> None:
+    config = HTMCodeNativeConfig.from_yaml(Path("configs/phase_a.yaml"))
+    indexer = RepositoryGraphIndexer(
+        key_dim=config.model.graph_key_dim,
+        value_dim=config.model.graph_value_dim,
+        max_files=config.model.repo_max_files,
+    )
+    index = indexer.build(WORKSPACE_ROOT, report_paths=REPORT_PATHS)
+    memory = RepositoryGraphMemory(
+        hidden_size=config.model.model_dim,
+        key_dim=config.model.graph_key_dim,
+        vocab_size=config.model.vocabulary_size,
+        top_k=16,
+        graph_copy_weight=config.model.graph_copy_weight,
+        samefile_bias=config.model.graph_samefile_bias,
+        import_bias=config.model.graph_import_bias,
+        symbol_bias=config.model.graph_symbol_bias,
+        test_bias=config.model.graph_test_bias,
+        diagnostic_bias=config.model.graph_diagnostic_bias,
+    )
+    memory.set_index(index)
+
+    expected_target_ids = {
+        node.node_id
+        for node in index.nodes
+        if node.kind in {"symbol", "function", "class"} and "GRAPH_SHARED_NAME" in node.copy_terms
+    }
+
+    result = memory.query(
+        hidden=torch.zeros(config.model.model_dim),
+        context=RepoGraphQueryContext(
+            file_path="app/core.py",
+            current_symbol_id="function:app/core.py:build_payload:7",
+            current_symbol_name="build_payload",
+            scope_path=("build_payload",),
+            token_value="GRAPH_SHARED_NAME",
+            token_class="identifier",
+            probe_kind="definition_use",
+            target_symbol_name="GRAPH_SHARED_NAME",
+            target_token_value="GRAPH_SHARED_NAME",
+        ),
+        vocabulary_snapshot=VocabularyRegistry(config.model.vocabulary_size).snapshot(),
+    )
+
+    assert expected_target_ids.intersection(result.candidate_node_ids)
+    assert result.target_node_id in expected_target_ids

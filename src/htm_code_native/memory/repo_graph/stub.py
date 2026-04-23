@@ -1259,7 +1259,17 @@ class RepositoryGraphMemory(nn.Module):
                 score += self.test_bias
             if flags["diagnostic"]:
                 score += self.diagnostic_bias
-            scored.append((score, score_tensor + self._bias_tensor(flags, device), node, flags, value))
+            priority_bonus = self._priority_bonus(node=node, context=context, flags=flags)
+            score += priority_bonus
+            scored.append(
+                (
+                    score,
+                    score_tensor + self._bias_tensor(flags, device) + torch.tensor(priority_bonus, dtype=torch.float32, device=device),
+                    node,
+                    flags,
+                    value,
+                )
+            )
 
         scored.sort(key=lambda item: item[0], reverse=True)
         selected = scored[: self.top_k]
@@ -1297,15 +1307,7 @@ class RepositoryGraphMemory(nn.Module):
         symbol_hits = sum(1 for _, _, _, flags, _ in selected if flags["symbol"])
         test_hits = sum(1 for _, _, _, flags, _ in selected if flags["test"])
         diagnostic_hits = sum(1 for _, _, _, flags, _ in selected if flags["diagnostic"])
-        target_node_id = None
-        for _score, _score_tensor, node, flags, _value in selected:
-            symbol_name = str(node.metadata.get("symbol_name", ""))
-            if symbol_name and context.current_symbol_name and symbol_name == context.current_symbol_name:
-                target_node_id = node.node_id
-                break
-            if context.token_value and context.token_value in node.copy_terms:
-                target_node_id = node.node_id
-                break
+        target_node_id = self._select_target_node_id(selected, context)
 
         context_vectors = torch.stack([item[4] for item in selected], dim=0)
         graph_context = torch.sum(weights.unsqueeze(-1) * context_vectors, dim=0)
@@ -1315,13 +1317,7 @@ class RepositoryGraphMemory(nn.Module):
         copy_distribution = torch.zeros(self.vocab_size, device=device)
         supported_token_ids: list[int] = []
         for weight, (_, _, node, _, _) in zip(weights, selected, strict=False):
-            supported_ids = [
-                token_id
-                for token_id in (
-                    vocabulary_snapshot.lookup_token(term) for term in node.copy_terms
-                )
-                if token_id is not None
-            ]
+            supported_ids = self._copy_token_ids_for_terms(node.copy_terms, vocabulary_snapshot)
             if not supported_ids:
                 continue
             mass = weight / len(supported_ids)
@@ -1367,6 +1363,41 @@ class RepositoryGraphMemory(nn.Module):
             target_node_id=target_node_id,
         )
 
+    def _copy_token_ids_for_terms(
+        self,
+        terms: Sequence[str],
+        vocabulary_snapshot: VocabularySnapshot,
+    ) -> list[int]:
+        token_ids: list[int] = []
+        seen: set[int] = set()
+        for term in terms:
+            for alias in self._copy_term_aliases(term):
+                token_id = vocabulary_snapshot.lookup_token(alias)
+                if token_id is None or token_id in seen:
+                    continue
+                seen.add(token_id)
+                token_ids.append(token_id)
+        return token_ids
+
+    def _copy_term_aliases(self, term: str) -> tuple[str, ...]:
+        raw = str(term).strip()
+        if not raw:
+            return ()
+        stripped = raw.strip("\"'")
+        aliases = [raw]
+        if stripped and stripped != raw:
+            aliases.append(stripped)
+        if stripped:
+            aliases.append(f"\"{stripped}\"")
+            aliases.append(f"'{stripped}'")
+        unique: list[str] = []
+        seen: set[str] = set()
+        for alias in aliases:
+            if alias and alias not in seen:
+                seen.add(alias)
+                unique.append(alias)
+        return tuple(unique)
+
     def _encode_context(self, context: RepoGraphQueryContext, device: torch.device) -> torch.Tensor:
         terms = [
             context.file_path,
@@ -1374,6 +1405,7 @@ class RepositoryGraphMemory(nn.Module):
             *context.scope_path,
             context.token_value,
             context.token_class,
+            context.target_copy_value or "",
         ]
         embedded = self._embed_terms(terms, device)
         return self.context_projection(embedded)
@@ -1469,6 +1501,82 @@ class RepositoryGraphMemory(nn.Module):
         if node.kind == "diagnostic":
             return node.file_path in diagnostic_files
         return node.file_path in diagnostic_files if node.file_path is not None else False
+
+    def _priority_bonus(
+        self,
+        *,
+        node: RepositoryGraphNode,
+        context: RepoGraphQueryContext,
+        flags: dict[str, bool],
+    ) -> float:
+        token_term = (context.target_token_value or context.token_value or "").strip("\"'")
+        copy_term = (context.target_copy_value or "").strip("\"'")
+        bonus = 0.0
+        if node.kind in {"symbol", "function", "class"}:
+            if context.target_symbol_name and node.name == context.target_symbol_name:
+                bonus += 1.25
+            elif context.current_symbol_name and node.name == context.current_symbol_name:
+                bonus += 0.85
+            if token_term:
+                if node.name == token_term:
+                    bonus += 0.75
+                elif token_term in node.copy_terms:
+                    bonus += 0.45 if flags["samefile"] else 0.35 if flags["import"] else 0.2
+            if copy_term:
+                if node.name == copy_term:
+                    bonus += 5.0
+                elif copy_term in node.copy_terms:
+                    bonus += 4.0 if flags["import"] else 3.0 if flags["samefile"] else 2.0
+            if flags["samefile"]:
+                bonus += 0.15
+            if flags["import"]:
+                bonus += 0.1
+        elif node.kind == "diagnostic" and context.probe_kind in {"diagnostic_to_symbol", "edit_fix"} and flags["diagnostic"]:
+            bonus += 0.3
+        elif node.kind == "test" and context.probe_kind in {"diagnostic_to_symbol", "edit_fix"} and flags["test"]:
+            bonus += 0.15
+        return bonus
+
+    def _select_target_node_id(
+        self,
+        selected: list[tuple[float, torch.Tensor, RepositoryGraphNode, dict[str, bool], torch.Tensor]],
+        context: RepoGraphQueryContext,
+    ) -> str | None:
+        token_term = (context.target_token_value or context.token_value or "").strip("\"'")
+        probe_kind = context.probe_kind or ""
+        predicates = [
+            lambda node, flags: context.target_symbol_name is not None
+            and node.kind in {"symbol", "function", "class"}
+            and node.name == context.target_symbol_name,
+            lambda node, flags: token_term
+            and node.kind in {"symbol", "function", "class"}
+            and node.name == token_term
+            and flags["samefile"],
+            lambda node, flags: token_term
+            and node.kind in {"symbol", "function", "class"}
+            and token_term in node.copy_terms
+            and flags["samefile"],
+            lambda node, flags: token_term
+            and node.kind in {"symbol", "function", "class"}
+            and node.name == token_term
+            and flags["import"],
+            lambda node, flags: token_term
+            and node.kind in {"symbol", "function", "class"}
+            and token_term in node.copy_terms
+            and flags["import"],
+            lambda node, flags: probe_kind in {"diagnostic_to_symbol", "edit_fix"}
+            and node.kind == "diagnostic"
+            and flags["diagnostic"],
+            lambda node, flags: probe_kind in {"diagnostic_to_symbol", "edit_fix"}
+            and node.kind == "test"
+            and flags["test"],
+            lambda node, flags: token_term and token_term in node.copy_terms,
+        ]
+        for predicate in predicates:
+            for _score, _score_tensor, node, flags, _value in selected:
+                if predicate(node, flags):
+                    return node.node_id
+        return None
 
 
 class NoOpRepoGraph:

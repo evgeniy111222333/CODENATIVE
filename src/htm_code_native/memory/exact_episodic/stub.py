@@ -10,6 +10,7 @@ from htm_code_native.data.types import (
     AlignedDocument,
     EpisodicChunk,
     EpisodicChunkMetadata,
+    ExactEpisodicMemoryState,
     ExactEpisodicReadResult,
     PhaseABatch,
 )
@@ -60,10 +61,27 @@ class ExactEpisodicMemory(nn.Module):
         self.pointer_query_projection = nn.Linear(hidden_size, pointer_key_dim)
         self.reset()
 
+    def init_state(self) -> ExactEpisodicMemoryState:
+        return ExactEpisodicMemoryState(
+            chunks=[],
+            next_chunk_id=0,
+            total_chunks_finalized=0,
+        )
+
     def reset(self) -> None:
-        self.chunks: list[EpisodicChunk] = []
-        self.next_chunk_id = 0
-        self.total_chunks_finalized = 0
+        self.load_state(self.init_state())
+
+    def load_state(self, state: ExactEpisodicMemoryState) -> None:
+        self.chunks = [self._clone_chunk(chunk) for chunk in state.chunks[: self.max_chunks]]
+        self.next_chunk_id = state.next_chunk_id
+        self.total_chunks_finalized = state.total_chunks_finalized
+
+    def export_state(self) -> ExactEpisodicMemoryState:
+        return ExactEpisodicMemoryState(
+            chunks=[self._clone_chunk(chunk) for chunk in self.chunks],
+            next_chunk_id=self.next_chunk_id,
+            total_chunks_finalized=self.total_chunks_finalized,
+        )
 
     def maybe_finalize_chunk(
         self,
@@ -222,6 +240,30 @@ class ExactEpisodicMemory(nn.Module):
             timestamp_end=timestamp,
             token_start_index=start_index,
             token_end_index=end_index,
+        )
+
+    def _clone_chunk(self, chunk: EpisodicChunk) -> EpisodicChunk:
+        metadata = EpisodicChunkMetadata(
+            chunk_id=chunk.metadata.chunk_id,
+            file_id=chunk.metadata.file_id,
+            symbol_id=chunk.metadata.symbol_id,
+            language=chunk.metadata.language,
+            chunk_type=chunk.metadata.chunk_type,
+            line_range=chunk.metadata.line_range,
+            scope_path=chunk.metadata.scope_path,
+            timestamp_start=chunk.metadata.timestamp_start,
+            timestamp_end=chunk.metadata.timestamp_end,
+            token_start_index=chunk.metadata.token_start_index,
+            token_end_index=chunk.metadata.token_end_index,
+        )
+        return EpisodicChunk(
+            chunk_id=chunk.chunk_id,
+            raw_bytes=chunk.raw_bytes,
+            token_ids=chunk.token_ids,
+            token_spans=chunk.token_spans,
+            key=chunk.key.detach().clone(),
+            pointer_keys=chunk.pointer_keys.detach().clone(),
+            metadata=metadata,
         )
 
 

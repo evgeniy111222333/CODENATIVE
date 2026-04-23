@@ -6,7 +6,7 @@ from typing import Protocol
 import torch
 from torch import nn
 
-from htm_code_native.data.types import ExactRecentReadResult, ExactRecentSlot
+from htm_code_native.data.types import ExactRecentMemoryState, ExactRecentReadResult, ExactRecentSlot
 
 
 class ExactRecentMemoryAdapter(Protocol):
@@ -46,12 +46,38 @@ class ExactRecentMemory(nn.Module):
         self.query_projection = nn.Linear(hidden_size, key_dim)
         self.reset()
 
+    def init_state(self) -> ExactRecentMemoryState:
+        return ExactRecentMemoryState(
+            slots=[None] * self.window_size,
+            write_pointer=0,
+            filled=0,
+            total_writes=0,
+            total_overwrites=0,
+        )
+
     def reset(self) -> None:
-        self.slots: list[ExactRecentSlot | None] = [None] * self.window_size
-        self.write_pointer = 0
-        self.filled = 0
-        self.total_writes = 0
-        self.total_overwrites = 0
+        self.load_state(self.init_state())
+
+    def load_state(self, state: ExactRecentMemoryState) -> None:
+        self.slots = [
+            None if slot is None else self._clone_slot(slot)
+            for slot in state.slots[: self.window_size]
+        ]
+        if len(self.slots) < self.window_size:
+            self.slots.extend([None] * (self.window_size - len(self.slots)))
+        self.write_pointer = state.write_pointer % self.window_size
+        self.filled = min(state.filled, self.window_size)
+        self.total_writes = state.total_writes
+        self.total_overwrites = state.total_overwrites
+
+    def export_state(self) -> ExactRecentMemoryState:
+        return ExactRecentMemoryState(
+            slots=[None if slot is None else self._clone_slot(slot) for slot in self.slots],
+            write_pointer=self.write_pointer,
+            filled=self.filled,
+            total_writes=self.total_writes,
+            total_overwrites=self.total_overwrites,
+        )
 
     def write(
         self,
@@ -129,6 +155,16 @@ class ExactRecentMemory(nn.Module):
             for slot in [*self.slots[self.write_pointer :], *self.slots[: self.write_pointer]]
             if slot is not None
         ]
+
+    def _clone_slot(self, slot: ExactRecentSlot) -> ExactRecentSlot:
+        return ExactRecentSlot(
+            token_id=slot.token_id,
+            start_byte=slot.start_byte,
+            end_byte=slot.end_byte,
+            byte_payload=slot.byte_payload,
+            key=slot.key.detach().clone(),
+            timestamp=slot.timestamp,
+        )
 
 
 class NoOpExactRecentMemory:

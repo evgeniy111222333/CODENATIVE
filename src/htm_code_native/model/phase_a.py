@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from htm_code_native.data.types import (
     HSSMState,
     PhaseABatch,
     PhaseAOutput,
+    PhaseASessionState,
     RepoGraphQueryContext,
     RepoGraphReadResult,
     RepositoryGraphIndex,
@@ -133,10 +135,25 @@ class PhaseACodeModel(nn.Module):
             if config.model.use_semantic_head
             else None
         )
+        self._legacy_stateless_eem_state = self.exact_episodic_memory.export_state()
 
     def set_repo_graph_index(self, index: RepositoryGraphIndex | None) -> None:
         self.repo_graph_memory.set_index(index)
         self.repo_graph_root = Path(index.root_path).resolve() if index is not None else None
+
+    def init_session_state(self, device: torch.device | None = None) -> PhaseASessionState:
+        target_device = device or self.level_gate_vectors.device
+        return PhaseASessionState(
+            hssm=self.hssm.init_runtime_state(device=target_device),
+            semantic_memory=self.semantic_memory.init_state(),
+            exact_recent=self.exact_recent_memory.init_state(),
+            exact_episodic=self.exact_episodic_memory.init_state(),
+            router=self.router.init_state(),
+            stream_token_index=0,
+            position_offset=0,
+            current_chunk_start=0,
+            previous_lane_stats=torch.zeros(5, device=target_device),
+        )
 
     def forward(
         self,
@@ -147,22 +164,51 @@ class PhaseACodeModel(nn.Module):
         global_step: int = 0,
         maintenance_budget: float = 0.0,
     ) -> PhaseAOutput:
+        session_state = self.init_session_state(device=batch.token_ids.device)
+        if not reset_eem:
+            session_state.exact_episodic = self._legacy_stateless_eem_state
+        output, next_session_state = self.forward_with_session(
+            batch=batch,
+            session_state=session_state,
+            phase=phase,
+            task_label=task_label,
+            global_step=global_step,
+            maintenance_budget=maintenance_budget,
+        )
+        self._legacy_stateless_eem_state = next_session_state.exact_episodic
+        self.exact_episodic_memory.load_state(next_session_state.exact_episodic)
+        return output
+
+    def forward_with_session(
+        self,
+        batch: PhaseABatch,
+        session_state: PhaseASessionState,
+        phase: TrainingPhase | str | None = None,
+        task_label: TaskLabel | str | None = None,
+        global_step: int = 0,
+        maintenance_budget: float = 0.0,
+    ) -> tuple[PhaseAOutput, PhaseASessionState]:
         phase_name = self._resolve_phase(phase)
         task_name = self._resolve_task_label(batch, task_label)
-        embeddings, encoder_parts = self.encoder(batch)
-        hssm_output = self.hssm(embeddings, batch.boundaries)
-        self.semantic_memory.reset()
-        self.exact_recent_memory.reset()
+        device = batch.token_ids.device
+        embeddings, encoder_parts = self.encoder(batch, position_offset=session_state.position_offset)
+        hssm_output, next_hssm_state = self.hssm(
+            embeddings,
+            batch.boundaries,
+            runtime_state=session_state.hssm,
+            step_offset=session_state.stream_token_index,
+        )
+        self.semantic_memory.load_state(session_state.semantic_memory)
+        self.exact_recent_memory.load_state(session_state.exact_recent)
+        self.exact_episodic_memory.load_state(session_state.exact_episodic)
         self.repo_graph_memory.reset()
-        self.router.reset()
-        if reset_eem:
-            self.exact_episodic_memory.reset()
+        self.router.load_state(session_state.router)
 
         seq_len = embeddings.shape[0]
         num_levels = self.config.hssm.num_levels
         hidden_size = self.config.model.model_dim
-        device = embeddings.device
         token_counts = Counter(token.value if token.value else token.token_type for token in batch.document.tokens)
+        stream_step_base = session_state.stream_token_index
 
         base_hidden_states = torch.zeros(seq_len, hidden_size, device=device)
         hidden_states = torch.zeros(seq_len, hidden_size, device=device)
@@ -185,6 +231,8 @@ class PhaseACodeModel(nn.Module):
         copy_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         episodic_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         graph_copy_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        graph_copy_target_ids = torch.full((seq_len,), fill_value=-1, dtype=torch.long, device=device)
+        graph_supervision_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         entropy_tensor = torch.zeros(seq_len, num_levels, device=device)
         lane_entropies = torch.zeros(seq_len, 5, device=device)
         router_weights = torch.zeros(seq_len, 5, device=device)
@@ -218,22 +266,37 @@ class PhaseACodeModel(nn.Module):
         total_graph_test_hits = 0
         total_graph_diagnostic_hits = 0
         graph_copy_hits = 0
+        graph_copy_supervision_steps = 0
         graph_fusion_steps = 0
         graph_task_eligible_steps = 0
+        graph_supervision_steps = 0
+        definition_use_steps = 0
+        diagnostic_supervision_steps = 0
+        edit_fix_supervision_steps = 0
+        definition_use_copy_steps = 0
+        diagnostic_copy_steps = 0
+        edit_fix_copy_steps = 0
         cold_semantic_invocations = 0
         eem_invocations = 0
         graph_invocations = 0
         symbol_link_hits = 0
+        definition_use_hits = 0
+        diagnostic_link_hits = 0
+        edit_fix_graph_hits = 0
+        definition_use_copy_hits = 0
+        diagnostic_copy_hits = 0
+        edit_fix_copy_hits = 0
         warmup_active_steps = 0
         dominant_lane_drop_steps = 0
         router_collapse_steps = 0
-        current_chunk_start = 0
-        previous_lane_stats = torch.zeros(5, device=device)
+        current_chunk_start = session_state.current_chunk_start
+        previous_lane_stats = session_state.previous_lane_stats.detach().to(device)
         graph_candidate_ids: list[tuple[str, ...]] = []
         graph_candidate_kinds: list[tuple[str, ...]] = []
         graph_candidate_names: list[tuple[str, ...]] = []
         graph_candidate_scores: list[torch.Tensor] = []
         graph_target_node_ids: list[str | None] = []
+        graph_supervision_modes: list[str] = []
         route_teacher_indices: list[int] = []
         route_teacher_expensive: list[tuple[int, int, int]] = []
         router_pre_logits: list[torch.Tensor] = []
@@ -242,6 +305,7 @@ class PhaseACodeModel(nn.Module):
         oracle_router_weight_list: list[torch.Tensor] = []
         warmup_steps_remaining = 0
         phase_policy = self._phase_policy(phase_name)
+        probe_kind = self._graph_probe_kind(batch, task_name)
 
         for step in range(seq_len):
             step_level_states = [
@@ -251,7 +315,7 @@ class PhaseACodeModel(nn.Module):
                 level_states=step_level_states,
                 last_update_indices=hssm_output.last_update_indices,
                 master_state=hssm_output.master_states[step],
-                step_index=step,
+                step_index=stream_step_base + step,
             )
 
             hot_outputs, hot_entropies, hot_reads = self.semantic_memory.read_hot(step_state)
@@ -368,7 +432,7 @@ class PhaseACodeModel(nn.Module):
                     token_id=int(batch.token_ids[step].item()),
                     span=(int(token_span[0]), int(token_span[1])),
                     payload=payload,
-                    timestamp=step,
+                    timestamp=step_state.step_index,
                 )
                 exact_recent_result = self.exact_recent_memory.read(hidden)
                 total_erm_reads += exact_recent_result.read_count
@@ -389,7 +453,7 @@ class PhaseACodeModel(nn.Module):
                         start_index=current_chunk_start,
                         end_index=step,
                         chunk_type=chunk_type,
-                        timestamp=step,
+                        timestamp=step_state.step_index,
                     )
                     if finalized_chunk is not None:
                         total_chunks_finalized += 1
@@ -467,6 +531,9 @@ class PhaseACodeModel(nn.Module):
             has_copy_target = False
             has_episodic_target = False
             graph_target_node_id = None
+            graph_supervision_mode = "none"
+            graph_target_present = False
+            graph_copy_present = False
             if step < seq_len - 1:
                 target_token_id = int(batch.targets[step].item())
                 has_copy_target = bool((exact_recent_result.slot_token_ids == target_token_id).any().item())
@@ -478,31 +545,69 @@ class PhaseACodeModel(nn.Module):
                 )
                 episodic_target_mask[step] = has_episodic_target
                 episodic_target_hits += int(has_episodic_target)
-
-                next_structure = batch.document.token_structures[step + 1]
-                has_graph_copy = bool((graph_result.copy_token_ids == target_token_id).any().item())
-                graph_copy_target_mask[step] = has_graph_copy
-                graph_copy_hits += int(has_graph_copy)
-                graph_target_node_id = self._resolve_graph_target_node(
-                    next_structure.symbol_id,
-                    next_structure.symbol_name,
-                    graph_result.candidate_node_ids,
-                    graph_result.candidate_names,
+                (
+                    graph_supervision_mode,
+                    graph_target_node_id,
+                    graph_copy_target_id,
+                    graph_link_active,
+                    graph_copy_active,
+                ) = self._resolve_graph_supervision_target(
+                    batch=batch,
+                    step=step,
+                    probe_kind=probe_kind,
+                    graph_enabled=graph_enabled,
                 )
-                symbol_link_hits += int(graph_target_node_id is not None)
+                graph_supervision_active = graph_link_active or graph_copy_active
+                graph_supervision_mask[step] = graph_supervision_active
+                graph_supervision_modes.append(graph_supervision_mode)
                 graph_target_node_ids.append(graph_target_node_id)
+                if graph_supervision_active:
+                    graph_supervision_steps += 1
+                    if graph_supervision_mode == "definition_use":
+                        definition_use_steps += 1
+                    elif graph_supervision_mode == "diagnostic_to_symbol":
+                        diagnostic_supervision_steps += 1
+                    elif graph_supervision_mode == "edit_fix":
+                        edit_fix_supervision_steps += 1
+                    if graph_link_active and graph_target_node_id is not None:
+                        graph_target_present = graph_target_node_id in graph_result.candidate_node_ids
+                        symbol_link_hits += int(graph_target_present)
+                        if graph_supervision_mode == "definition_use":
+                            definition_use_hits += int(graph_target_present)
+                        elif graph_supervision_mode == "diagnostic_to_symbol":
+                            diagnostic_link_hits += int(graph_target_present)
+                        elif graph_supervision_mode == "edit_fix":
+                            edit_fix_graph_hits += int(graph_target_present)
+                    if graph_copy_active and graph_copy_target_id >= 0:
+                        graph_copy_target_mask[step] = True
+                        graph_copy_target_ids[step] = graph_copy_target_id
+                        graph_copy_supervision_steps += 1
+                        graph_copy_present = bool((graph_result.copy_token_ids == graph_copy_target_id).any().item())
+                        graph_copy_hits += int(graph_copy_present)
+                        if graph_supervision_mode == "definition_use":
+                            definition_use_copy_steps += 1
+                            definition_use_copy_hits += int(graph_copy_present)
+                        elif graph_supervision_mode == "diagnostic_to_symbol":
+                            diagnostic_copy_steps += 1
+                            diagnostic_copy_hits += int(graph_copy_present)
+                        elif graph_supervision_mode == "edit_fix":
+                            edit_fix_copy_steps += 1
+                            edit_fix_copy_hits += int(graph_copy_present)
+                else:
+                    graph_copy_target_mask[step] = False
 
                 teacher_index, teacher_expensive = self._route_teacher(
                     batch=batch,
                     step=step,
                     copy_hit=has_copy_target,
                     episodic_hit=has_episodic_target,
-                    graph_hit=bool(graph_copy_target_mask[step].item()) or graph_target_node_id is not None,
+                    graph_hit=graph_target_present or graph_copy_present,
                     phase=phase_name,
                 )
                 route_teacher_indices.append(teacher_index)
                 route_teacher_expensive.append(teacher_expensive)
             else:
+                graph_supervision_modes.append("none")
                 graph_target_node_ids.append(None)
                 route_teacher_indices.append(0)
                 route_teacher_expensive.append((0, 0, 0))
@@ -525,7 +630,7 @@ class PhaseACodeModel(nn.Module):
             oracle_mask = self._oracle_availability(
                 copy_hit=erm_enabled and has_copy_target,
                 episodic_hit=eem_enabled and has_episodic_target,
-                graph_hit=graph_enabled and (bool(graph_copy_target_mask[step].item()) or graph_target_node_id is not None),
+                graph_hit=graph_enabled and (graph_copy_present or graph_target_present),
                 post_mask=post_mask,
                 phase=phase_name,
             )
@@ -656,6 +761,7 @@ class PhaseACodeModel(nn.Module):
             "graph_reads": float(total_graph_reads),
             "graph_candidates": float(total_graph_candidates),
             "graph_copy_hits": float(graph_copy_hits),
+            "graph_copy_supervision_steps": float(graph_copy_supervision_steps),
             "graph_samefile_hits": float(total_graph_samefile_hits),
             "graph_import_hits": float(total_graph_import_hits),
             "graph_symbol_hits": float(total_graph_symbol_hits),
@@ -663,10 +769,17 @@ class PhaseACodeModel(nn.Module):
             "graph_diagnostic_hits": float(total_graph_diagnostic_hits),
             "graph_fusion_steps": float(graph_fusion_steps),
             "graph_task_eligible_steps": float(graph_task_eligible_steps),
+            "graph_supervision_steps": float(graph_supervision_steps),
             "cold_semantic_invocations": float(cold_semantic_invocations),
             "eem_invocations": float(eem_invocations),
             "graph_invocations": float(graph_invocations),
             "symbol_link_hits": float(symbol_link_hits),
+            "definition_use_hits": float(definition_use_hits),
+            "diagnostic_link_hits": float(diagnostic_link_hits),
+            "edit_fix_graph_hits": float(edit_fix_graph_hits),
+            "definition_use_copy_hits": float(definition_use_copy_hits),
+            "diagnostic_copy_hits": float(diagnostic_copy_hits),
+            "edit_fix_copy_hits": float(edit_fix_copy_hits),
             "avg_energy_proxy": float(energy_proxy.mean().item()),
             "always_on_energy": float(always_on_energy),
             "full_enabled_energy": float(full_enabled_energy),
@@ -684,13 +797,36 @@ class PhaseACodeModel(nn.Module):
         phase_exit_probe_metrics = {
             "recent_copy_hit_rate": float(copy_target_hits / max(seq_len - 1, 1)),
             "episodic_hit_rate": float(episodic_target_hits / max(seq_len - 1, 1)),
-            "graph_copy_hit_rate": float(graph_copy_hits / max(seq_len - 1, 1)),
-            "symbol_link_hit_rate": float(symbol_link_hits / max(seq_len - 1, 1)),
+            "graph_copy_hit_rate": float(graph_copy_hits / max(graph_copy_supervision_steps, 1)),
+            "symbol_link_hit_rate": float(symbol_link_hits / max(graph_supervision_steps, 1)),
+            "graph_supervision_count": float(graph_supervision_steps),
+            "definition_use_hit_rate": float(definition_use_hits / max(definition_use_steps, 1)),
+            "diagnostic_link_hit_rate": float(diagnostic_link_hits / max(diagnostic_supervision_steps, 1)),
+            "edit_fix_graph_hit_rate": float(edit_fix_graph_hits / max(edit_fix_supervision_steps, 1)),
+            "definition_use_graph_copy_hit_rate": float(definition_use_copy_hits / max(definition_use_copy_steps, 1)),
+            "diagnostic_graph_copy_hit_rate": float(diagnostic_copy_hits / max(diagnostic_copy_steps, 1)),
+            "edit_fix_copy_hit_rate": float(edit_fix_copy_hits / max(edit_fix_copy_steps, 1)),
             "route_entropy": float(route_entropy),
             "energy_proxy": float(energy_proxy.mean().item()),
         }
 
-        return PhaseAOutput(
+        max_position_embeddings = max(self.config.model.max_position_embeddings, 1)
+        next_position_offset = min(
+            session_state.position_offset + seq_len,
+            max_position_embeddings - 1,
+        )
+        next_session_state = PhaseASessionState(
+            hssm=next_hssm_state,
+            semantic_memory=self.semantic_memory.export_state(),
+            exact_recent=self.exact_recent_memory.export_state(),
+            exact_episodic=self.exact_episodic_memory.export_state(),
+            router=self.router.export_state(),
+            stream_token_index=stream_step_base + seq_len,
+            position_offset=next_position_offset,
+            current_chunk_start=0,
+            previous_lane_stats=previous_lane_stats.detach().clone(),
+        )
+        output = PhaseAOutput(
             logits=logits,
             lm_logits=lm_logits,
             semantic_logits=semantic_logits,
@@ -704,6 +840,7 @@ class PhaseACodeModel(nn.Module):
             graph_logits=graph_logits,
             graph_attention=graph_attention,
             graph_copy_target_mask=graph_copy_target_mask,
+            graph_copy_target_ids=graph_copy_target_ids,
             base_hidden_states=base_hidden_states,
             graph_contexts=graph_contexts,
             router_weights=router_weights,
@@ -736,6 +873,10 @@ class PhaseACodeModel(nn.Module):
                 "graph_candidate_names": graph_candidate_names,
                 "graph_candidate_scores": graph_candidate_scores,
                 "graph_target_node_ids": graph_target_node_ids,
+                "graph_copy_target_ids": graph_copy_target_ids,
+                "graph_supervision_mask": graph_supervision_mask,
+                "graph_supervision_mode": graph_supervision_modes,
+                "graph_supervision_count": float(graph_supervision_steps),
                 "route_teacher_indices": route_teacher_indices,
                 "route_teacher_expensive": route_teacher_expensive,
                 "router_pre_logits": router_pre_logits,
@@ -747,8 +888,25 @@ class PhaseACodeModel(nn.Module):
                 "infill_span": None,
                 "maintenance_decision": None,
                 "phase_exit_probe_metrics": phase_exit_probe_metrics,
+                "session_stats": {
+                    "stream_token_index": float(next_session_state.stream_token_index),
+                    "position_offset": float(next_session_state.position_offset),
+                    "router_history_length": float(len(next_session_state.router.dominant_mass_history)),
+                    "semantic_hot_slots": float(
+                        sum(len(slots) for slots in next_session_state.semantic_memory.hot_slots.values())
+                    ),
+                    "semantic_cold_clusters": float(
+                        sum(
+                            len(clusters)
+                            for clusters in next_session_state.semantic_memory.cold_clusters.values()
+                        )
+                    ),
+                    "erm_filled": float(next_session_state.exact_recent.filled),
+                    "stored_chunks": float(len(next_session_state.exact_episodic.chunks)),
+                },
             },
         )
+        return output, next_session_state
 
     def _aggregate_semantic_context(
         self,
@@ -772,6 +930,14 @@ class PhaseACodeModel(nn.Module):
 
     def _graph_query_context(self, batch: PhaseABatch, step: int) -> RepoGraphQueryContext:
         structure = batch.document.token_structures[step]
+        target_symbol = self._metadata_text(batch.task_metadata.get("target_symbol"))
+        target_token_value = self._metadata_text(batch.task_metadata.get("target_token_value"))
+        probe_kind = self._graph_probe_kind(batch, TaskLabel(batch.task_metadata.get("task_label", TaskLabel.AR.value)))
+        target_copy_value = (
+            self._metadata_text(batch.task_metadata.get("replacement_text"))
+            if probe_kind == "edit_fix"
+            else (target_token_value or target_symbol)
+        )
         return RepoGraphQueryContext(
             file_path=self._normalize_graph_path(structure.file_id),
             current_symbol_id=structure.symbol_id,
@@ -779,6 +945,10 @@ class PhaseACodeModel(nn.Module):
             scope_path=structure.scope_path,
             token_value=batch.document.tokens[step].value,
             token_class=batch.document.tokens[step].token_class.value,
+            probe_kind=probe_kind,
+            target_symbol_name=target_symbol,
+            target_token_value=target_token_value,
+            target_copy_value=target_copy_value,
         )
 
     def _router_metadata(
@@ -978,21 +1148,200 @@ class PhaseACodeModel(nn.Module):
             return True
         return False
 
-    def _resolve_graph_target_node(
+    def _graph_probe_kind(self, batch: PhaseABatch, task_name: TaskLabel) -> str:
+        probe_kind = self._metadata_text(batch.task_metadata.get("probe_kind"))
+        if probe_kind is not None:
+            return probe_kind
+        if task_name == TaskLabel.EDIT_FIX:
+            return "edit_fix"
+        if task_name == TaskLabel.REPO_GRAPH:
+            return "definition_use"
+        return task_name.value
+
+    def _resolve_graph_supervision_target(
         self,
-        target_symbol_id: str | None,
-        target_symbol_name: str | None,
-        candidate_node_ids: tuple[str, ...],
-        candidate_names: tuple[str, ...],
-    ) -> str | None:
-        if target_symbol_id is not None and target_symbol_id in candidate_node_ids:
-            return target_symbol_id
-        if target_symbol_name is None:
+        *,
+        batch: PhaseABatch,
+        step: int,
+        probe_kind: str,
+        graph_enabled: bool,
+    ) -> tuple[str, str | None, int, bool, bool]:
+        if not graph_enabled or self.repo_graph_memory.index is None:
+            return "none", None, -1, False, False
+        token = batch.document.tokens[step]
+        token_value = self._normalized_token_text(token.value)
+        target_token_value = self._metadata_text(batch.task_metadata.get("target_token_value"))
+        target_symbol = self._metadata_text(batch.task_metadata.get("target_symbol"))
+        anchor_value = target_token_value or target_symbol or token_value
+        if not self._is_graph_supervision_anchor(
+            batch=batch,
+            step=step,
+            probe_kind=probe_kind,
+            anchor_value=anchor_value,
+        ):
+            return "none", None, -1, False, False
+
+        relative_path = self._normalize_graph_path(batch.document.file_path)
+        graph_copy_value = self._graph_copy_value_for_probe(batch, probe_kind, anchor_value)
+        graph_copy_target_id = self._lookup_graph_copy_target_id(batch, graph_copy_value)
+        if probe_kind == "definition_use":
+            target_node_id = self._resolve_symbol_target_node(
+                relative_path=relative_path,
+                token_value=target_symbol or anchor_value,
+            )
+            link_active = target_node_id is not None
+            copy_active = graph_copy_target_id >= 0
+            return (
+                ("definition_use", target_node_id, graph_copy_target_id, link_active, copy_active)
+                if link_active or copy_active
+                else ("none", None, -1, False, False)
+            )
+        if probe_kind in {"diagnostic_to_symbol", "edit_fix"}:
+            target_node_id = self._resolve_symbol_target_node(
+                relative_path=relative_path,
+                token_value=target_symbol or anchor_value,
+            )
+            if target_node_id is None:
+                target_node_id = self._resolve_diagnostic_target_node(relative_path)
+            link_active = target_node_id is not None
+            copy_active = graph_copy_target_id >= 0
+            return (
+                (probe_kind, target_node_id, graph_copy_target_id, link_active, copy_active)
+                if link_active or copy_active
+                else ("none", None, -1, False, False)
+            )
+        return "none", None, -1, False, False
+
+    def _is_graph_supervision_anchor(
+        self,
+        *,
+        batch: PhaseABatch,
+        step: int,
+        probe_kind: str,
+        anchor_value: str,
+    ) -> bool:
+        if probe_kind == "edit_fix":
+            edit_span = batch.task_metadata.get("edit_target_span")
+            if isinstance(edit_span, tuple) and len(edit_span) == 2:
+                return int(edit_span[0]) <= step < int(edit_span[1])
+            return False
+        if not anchor_value:
+            return False
+        token_value = self._normalized_token_text(batch.document.tokens[step].value)
+        if token_value != self._normalized_token_text(anchor_value):
+            return False
+        return step == self._preferred_graph_anchor_step(batch, anchor_value)
+
+    def _preferred_graph_anchor_step(self, batch: PhaseABatch, anchor_value: str) -> int | None:
+        normalized_anchor = self._normalized_token_text(anchor_value)
+        candidates: list[tuple[float, int]] = []
+        for token in batch.document.tokens:
+            if self._normalized_token_text(token.value) != normalized_anchor:
+                continue
+            structure = batch.document.token_structures[token.index]
+            score = 0.0
+            if structure.scope_path:
+                score += 3.0
+            if not {"import_statement", "import_from_statement"}.intersection(structure.ast_path):
+                score += 2.0
+            if token.token_class == TokenClass.IDENTIFIER:
+                score += 1.0
+            candidates.append((score, token.index))
+        if not candidates:
             return None
-        for candidate_id, candidate_name in zip(candidate_node_ids, candidate_names, strict=False):
-            if candidate_name == target_symbol_name:
-                return candidate_id
-        return None
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return candidates[0][1]
+
+    def _graph_copy_value_for_probe(self, batch: PhaseABatch, probe_kind: str, anchor_value: str) -> str:
+        if probe_kind == "edit_fix":
+            replacement = self._metadata_text(batch.task_metadata.get("replacement_text"))
+            if replacement is not None:
+                return replacement
+        return anchor_value
+
+    def _lookup_graph_copy_target_id(self, batch: PhaseABatch, value: str) -> int:
+        for alias in self._graph_copy_value_aliases(value):
+            token_id = batch.vocabulary_snapshot.lookup_token(alias)
+            if token_id is not None:
+                return int(token_id)
+        return -1
+
+    def _graph_copy_value_aliases(self, value: str) -> tuple[str, ...]:
+        raw = str(value).strip()
+        if not raw:
+            return ()
+        stripped = raw.strip("\"'")
+        aliases = [raw]
+        if stripped and stripped != raw:
+            aliases.append(stripped)
+        if stripped:
+            aliases.append(f"\"{stripped}\"")
+            aliases.append(f"'{stripped}'")
+        unique: list[str] = []
+        seen: set[str] = set()
+        for alias in aliases:
+            if alias and alias not in seen:
+                seen.add(alias)
+                unique.append(alias)
+        return tuple(unique)
+
+    def _normalized_token_text(self, value: object) -> str:
+        return str(value).strip().strip("\"'")
+
+    def _resolve_symbol_target_node(
+        self,
+        *,
+        relative_path: str,
+        token_value: str,
+    ) -> str | None:
+        index = self.repo_graph_memory.index
+        if index is None or not token_value:
+            return None
+        import_closure = set(index.import_closure_by_file.get(relative_path, ()))
+        candidates: list[tuple[float, str]] = []
+        for node in index.nodes:
+            if node.kind not in {"symbol", "function", "class"}:
+                continue
+            if node.file_path is None:
+                continue
+            if node.file_path != relative_path and node.file_path not in import_closure:
+                continue
+            if node.name != token_value and token_value not in node.copy_terms:
+                continue
+            score = 0.0
+            if node.name == token_value:
+                score += 4.0
+            if token_value in node.copy_terms:
+                score += 1.5
+            if node.file_path == relative_path:
+                score += 2.0
+            if node.file_path in import_closure:
+                score += 1.0
+            candidates.append((score, node.node_id))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
+    def _resolve_diagnostic_target_node(self, relative_path: str) -> str | None:
+        index = self.repo_graph_memory.index
+        if index is None:
+            return None
+        diagnostic_nodes = [
+            node
+            for node in index.nodes
+            if node.kind == "diagnostic" and node.file_path == relative_path
+        ]
+        if not diagnostic_nodes:
+            return None
+        diagnostic_nodes.sort(key=lambda node: node.node_id)
+        return diagnostic_nodes[0].node_id
+
+    def _metadata_text(self, value: object) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     def _empty_erm_result(self, device: torch.device) -> ExactRecentReadResult:
         return ExactRecentReadResult(

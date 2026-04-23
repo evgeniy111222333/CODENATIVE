@@ -112,6 +112,7 @@ class PhaseAModelConfig:
     probe_min_recent_copy_hit_rate: float = 0.01
     probe_min_episodic_hit_rate: float = 0.01
     probe_min_symbol_link_hit_rate: float = 0.01
+    probe_min_graph_copy_hit_rate: float = 0.01
     probe_min_route_entropy: float = 0.5
     probe_min_patch_candidate_valid_rate: float = 0.25
     probe_min_best_patch_hit_rate: float = 0.25

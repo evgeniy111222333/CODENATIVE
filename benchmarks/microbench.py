@@ -13,9 +13,10 @@ if str(SRC) not in sys.path:
 import torch
 
 from htm_code_native.cli import build_repo_graph_index, load_config
-from htm_code_native.data.types import TrainingPhase
+from htm_code_native.data.types import PhaseABatch, RepositoryGraphIndex, TaskLabel, TrainingPhase
 from htm_code_native.model.phase_a import PhaseACodeModel
 from htm_code_native.training import build_task_batch, build_task_example
+from htm_code_native.training.tasks import _iter_contiguous_task_windows
 
 
 def _mean_target_probability(output, batch, token_class: str) -> float:
@@ -58,21 +59,70 @@ def _mean_graph_target_probability(
 ) -> float:
     values: list[float] = []
     candidate_kinds = output.auxiliary.get("graph_candidate_kinds", [])
+    graph_copy_target_ids = output.graph_copy_target_ids
     seq_len = len(batch.document.tokens)
     for step in range(seq_len - 1):
         if output.graph_logits is None or not bool(output.graph_copy_target_mask[step].item()):
             continue
-        target_token = batch.document.tokens[step + 1]
-        if token_class is not None and target_token.token_class.value != token_class:
-            continue
         step_kinds = set(candidate_kinds[step]) if step < len(candidate_kinds) else set()
         if required_kinds is not None and not step_kinds.intersection(required_kinds):
             continue
-        target_id = int(batch.targets[step].item())
+        target_id = (
+            int(graph_copy_target_ids[step].item())
+            if graph_copy_target_ids is not None
+            else int(batch.targets[step].item())
+        )
+        if target_id < 0:
+            continue
+        target_text = batch.vocabulary_snapshot.id_to_token.get(target_id, "")
+        if token_class is not None and _token_class_for_graph_copy_target(target_text) != token_class:
+            continue
         values.append(float(output.graph_logits[step, target_id].exp().item()))
     if not values:
         return 0.0
     return sum(values) / len(values)
+
+
+def _token_class_for_graph_copy_target(value: str) -> str:
+    stripped = value.strip("\"'")
+    if stripped.isidentifier():
+        return "identifier"
+    try:
+        float(stripped)
+    except ValueError:
+        return "string"
+    return "number"
+
+
+def _infer_graph_probe_metadata(batch: PhaseABatch, graph_index: RepositoryGraphIndex | None) -> dict[str, str]:
+    if graph_index is None:
+        return {}
+    copy_terms = {
+        term
+        for node in graph_index.nodes
+        if node.kind in {"symbol", "function", "class"}
+        for term in node.copy_terms
+    }
+    candidates: list[tuple[float, str]] = []
+    for token in batch.document.tokens:
+        if token.token_class.value != "identifier" or token.value not in copy_terms:
+            continue
+        structure = batch.document.token_structures[token.index]
+        score = 0.0
+        if structure.scope_path:
+            score += 3.0
+        if not {"import_statement", "import_from_statement"}.intersection(structure.ast_path):
+            score += 2.0
+        candidates.append((score, token.value))
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    target = candidates[0][1]
+    return {
+        "probe_kind": "definition_use",
+        "target_token_value": target,
+        "target_symbol": target,
+    }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -80,6 +130,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("file_path", nargs="?", default="tests/fixtures/repo_graph_workspace/app/core.py")
     parser.add_argument("--repo-root")
     parser.add_argument("--report-path", action="append", default=[])
+    parser.add_argument("--chunk-size", type=int, default=0)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--iterations", type=int, default=5)
     return parser.parse_args(argv)
 
 
@@ -101,15 +154,40 @@ def main() -> int:
         repo_root=args.repo_root,
         report_paths=args.report_path,
     )
+    if task_label == TaskLabel.REPO_GRAPH and not example.metadata.get("target_token_value"):
+        inferred_metadata = _infer_graph_probe_metadata(batch, graph_index)
+        if inferred_metadata:
+            example = build_task_example(
+                args.file_path,
+                task_label,
+                repo_root=args.repo_root,
+                report_paths=args.report_path,
+                metadata=inferred_metadata,
+            )
+            task_batch = build_task_batch(example, config)
+            batch = task_batch.batch
+    windows = _iter_contiguous_task_windows(task_batch, args.chunk_size) if args.chunk_size > 0 else [task_batch]
     model = PhaseACodeModel(config)
     model.set_repo_graph_index(graph_index)
     model.eval()
 
-    warmup = 2
-    iterations = 5
+    warmup = max(args.warmup, 0)
+    iterations = max(args.iterations, 1)
     for _ in range(warmup):
         with torch.no_grad():
-            model(batch, phase=phase, task_label=task_label)
+            if len(windows) == 1:
+                model(batch, phase=phase, task_label=task_label)
+                continue
+            session_state = model.init_session_state(device=batch.token_ids.device)
+            for window_index, window in enumerate(windows):
+                _, session_state = model.forward_with_session(
+                    window.batch,
+                    session_state=session_state,
+                    phase=phase,
+                    task_label=task_label,
+                    global_step=window_index,
+                    maintenance_budget=1.0,
+                )
 
     start = time.perf_counter()
     hot_reads = 0.0
@@ -140,56 +218,88 @@ def main() -> int:
     graph_invocation_rate = 0.0
     eem_invocation_rate = 0.0
     cold_semantic_invocation_rate = 0.0
+    erm_carryover_hits = 0.0
+    router_continuity_windows = 0.0
+    total_windows = 0.0
+    tokens = 0
     for _ in range(iterations):
         with torch.no_grad():
-            output = model(batch, phase=phase, task_label=task_label)
-        hot_reads += output.memory_stats["hot_reads"]
-        cold_reads += output.memory_stats["cold_reads"]
-        maintenance += output.memory_stats["maintenance_invocations"]
-        erm_reads += output.memory_stats["erm_reads"]
-        erm_writes += output.memory_stats["erm_writes"]
-        erm_overwrites += output.memory_stats["erm_overwrites"]
-        copy_hits += output.memory_stats["copy_target_hits"]
-        episodic_hits += output.memory_stats["episodic_target_hits"]
-        identifier_recall += _mean_target_probability(output, batch, "identifier")
-        string_recall += _mean_target_probability(output, batch, "string")
-        number_recall += _mean_target_probability(output, batch, "number")
-        eem_reads += output.memory_stats["eem_reads"]
-        chunks_finalized += output.memory_stats["chunks_finalized"]
-        chunk_overhead += output.memory_stats["avg_chunk_overhead"]
-        long_identifier_recall += _mean_episodic_target_probability(output, batch, "identifier")
-        long_string_recall += _mean_episodic_target_probability(output, batch, "string")
-        long_number_recall += _mean_episodic_target_probability(output, batch, "number")
-        graph_reads += output.memory_stats["graph_reads"]
-        graph_candidates += output.memory_stats["graph_candidates"]
-        graph_symbol_recall += _mean_graph_target_probability(
-            output,
-            batch,
-            token_class="identifier",
-            required_kinds={"symbol", "function", "class"},
-        )
-        graph_test_recall += _mean_graph_target_probability(
-            output,
-            batch,
-            required_kinds={"test"},
-        )
-        graph_diagnostic_recall += _mean_graph_target_probability(
-            output,
-            batch,
-            required_kinds={"diagnostic"},
-        )
-        route_entropy += float(output.diagnostics["route_entropy"])
-        energy_proxy += float(output.memory_stats["avg_energy_proxy"])
-        skipped_expensive += float(output.memory_stats["avg_skipped_expensive_reads"])
-        graph_invocation_rate += float(output.memory_stats["graph_invocations"]) / max(len(batch.document.tokens), 1)
-        eem_invocation_rate += float(output.memory_stats["eem_invocations"]) / max(len(batch.document.tokens), 1)
-        cold_semantic_invocation_rate += float(output.memory_stats["cold_semantic_invocations"]) / max(len(batch.document.tokens), 1)
+            if len(windows) == 1:
+                outputs = [model(batch, phase=phase, task_label=task_label)]
+            else:
+                outputs = []
+                session_state = model.init_session_state(device=batch.token_ids.device)
+                for window_index, window in enumerate(windows):
+                    output, session_state = model.forward_with_session(
+                        window.batch,
+                        session_state=session_state,
+                        phase=phase,
+                        task_label=task_label,
+                        global_step=window_index,
+                        maintenance_budget=1.0,
+                    )
+                    outputs.append(output)
+        for window_index, (window, output) in enumerate(zip(windows, outputs, strict=False)):
+            window_batch = window.batch
+            hot_reads += output.memory_stats["hot_reads"]
+            cold_reads += output.memory_stats["cold_reads"]
+            maintenance += output.memory_stats["maintenance_invocations"]
+            erm_reads += output.memory_stats["erm_reads"]
+            erm_writes += output.memory_stats["erm_writes"]
+            erm_overwrites += output.memory_stats["erm_overwrites"]
+            copy_hits += output.memory_stats["copy_target_hits"]
+            episodic_hits += output.memory_stats["episodic_target_hits"]
+            identifier_recall += _mean_target_probability(output, window_batch, "identifier")
+            string_recall += _mean_target_probability(output, window_batch, "string")
+            number_recall += _mean_target_probability(output, window_batch, "number")
+            eem_reads += output.memory_stats["eem_reads"]
+            chunks_finalized += output.memory_stats["chunks_finalized"]
+            chunk_overhead += output.memory_stats["avg_chunk_overhead"]
+            long_identifier_recall += _mean_episodic_target_probability(output, window_batch, "identifier")
+            long_string_recall += _mean_episodic_target_probability(output, window_batch, "string")
+            long_number_recall += _mean_episodic_target_probability(output, window_batch, "number")
+            graph_reads += output.memory_stats["graph_reads"]
+            graph_candidates += output.memory_stats["graph_candidates"]
+            graph_symbol_recall += _mean_graph_target_probability(
+                output,
+                window_batch,
+                token_class="identifier",
+                required_kinds={"symbol", "function", "class"},
+            )
+            graph_test_recall += _mean_graph_target_probability(
+                output,
+                window_batch,
+                required_kinds={"test"},
+            )
+            graph_diagnostic_recall += _mean_graph_target_probability(
+                output,
+                window_batch,
+                required_kinds={"diagnostic"},
+            )
+            route_entropy += float(output.diagnostics["route_entropy"])
+            energy_proxy += float(output.memory_stats["avg_energy_proxy"])
+            skipped_expensive += float(output.memory_stats["avg_skipped_expensive_reads"])
+            graph_invocation_rate += float(output.memory_stats["graph_invocations"]) / max(len(window_batch.document.tokens), 1)
+            eem_invocation_rate += float(output.memory_stats["eem_invocations"]) / max(len(window_batch.document.tokens), 1)
+            cold_semantic_invocation_rate += float(output.memory_stats["cold_semantic_invocations"]) / max(len(window_batch.document.tokens), 1)
+            if window_index > 0:
+                erm_carryover_hits += float(output.memory_stats["copy_target_hits"])
+                if (
+                    output.memory_stats["warmup_steps_remaining"] > 0
+                    or output.memory_stats["router_collapse_steps"] > 0
+                    or output.auxiliary["session_stats"]["router_history_length"] > 0
+                ):
+                    router_continuity_windows += 1.0
+            total_windows += 1.0
+            tokens += len(window_batch.document.tokens)
     elapsed = time.perf_counter() - start
-    tokens = len(batch.document.tokens) * iterations
+    last_output = outputs[-1]
 
     print(
         {
             "file": args.file_path,
+            "chunk_size": args.chunk_size,
+            "session_window_count": len(windows),
             "tokens_per_sec": tokens / max(elapsed, 1e-6),
             "avg_hot_reads": hot_reads / iterations,
             "avg_cold_reads": cold_reads / iterations,
@@ -215,15 +325,18 @@ def main() -> int:
             "graph_diagnostic_recall": graph_diagnostic_recall / iterations,
             "avg_route_entropy": route_entropy / iterations,
             "avg_energy_proxy": energy_proxy / iterations,
-            "avg_warmup_beta": float(output.warmup_beta.mean().item()),
-            "collapse_detected": bool(output.collapse_detected.any().item()),
+            "avg_warmup_beta": float(last_output.warmup_beta.mean().item()),
+            "collapse_detected": bool(last_output.collapse_detected.any().item()),
             "avg_skipped_expensive_reads": skipped_expensive / iterations,
             "graph_invocation_rate": graph_invocation_rate / iterations,
             "eem_invocation_rate": eem_invocation_rate / iterations,
             "cold_semantic_invocation_rate": cold_semantic_invocation_rate / iterations,
-            "always_on_energy": output.memory_stats["always_on_energy"],
-            "full_enabled_energy": output.memory_stats["full_enabled_energy"],
-            "hard_gated_energy_savings": output.memory_stats["hard_gated_energy_savings"],
+            "avg_erm_carryover_hits": erm_carryover_hits / iterations,
+            "avg_router_continuity_windows": router_continuity_windows / iterations,
+            "avg_windows_per_iteration": total_windows / iterations,
+            "always_on_energy": last_output.memory_stats["always_on_energy"],
+            "full_enabled_energy": last_output.memory_stats["full_enabled_energy"],
+            "hard_gated_energy_savings": last_output.memory_stats["hard_gated_energy_savings"],
         }
     )
     return 0

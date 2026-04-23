@@ -108,3 +108,48 @@ def test_collapse_detector_triggers_after_window() -> None:
         )
     assert collapse is True
     assert remaining >= 0
+
+
+def test_router_runtime_state_resumes_collapse_history() -> None:
+    router = build_router(collapse_window=3, threshold=0.8)
+    learned = torch.tensor([0.99, 0.01, 0.0, 0.0, 0.0])
+    post_mask = torch.tensor([1, 1, 0, 0, 0], dtype=torch.bool)
+    oracle = torch.tensor([1, 1, 0, 0, 0], dtype=torch.bool)
+
+    for step in range(2):
+        router.apply_warmup(
+            post_logits=torch.zeros(5),
+            learned_weights=learned,
+            post_mask=post_mask,
+            oracle_availability=oracle,
+            phase=TrainingPhase.PHASE_B,
+            global_step=step,
+            training=True,
+        )
+    resumed = build_router(collapse_window=3, threshold=0.8)
+    resumed.load_state(router.export_state())
+    fresh = build_router(collapse_window=3, threshold=0.8)
+
+    _, _, _, _, _, resumed_collapse, _, _, resumed_remaining = resumed.apply_warmup(
+        post_logits=torch.zeros(5),
+        learned_weights=learned,
+        post_mask=post_mask,
+        oracle_availability=oracle,
+        phase=TrainingPhase.PHASE_B,
+        global_step=2,
+        training=True,
+    )
+    _, _, _, _, _, fresh_collapse, _, _, fresh_remaining = fresh.apply_warmup(
+        post_logits=torch.zeros(5),
+        learned_weights=learned,
+        post_mask=post_mask,
+        oracle_availability=oracle,
+        phase=TrainingPhase.PHASE_B,
+        global_step=2,
+        training=True,
+    )
+
+    assert resumed_collapse is True
+    assert fresh_collapse is False
+    assert resumed_remaining >= 0
+    assert fresh_remaining == 0

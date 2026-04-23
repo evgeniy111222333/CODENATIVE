@@ -6,7 +6,13 @@ import torch
 from torch import nn
 
 from htm_code_native.config.settings import HSSMConfig, SemanticMemoryConfig
-from htm_code_native.data.types import ColdCluster, HSSMState, SemanticReadResult, SemanticSlot
+from htm_code_native.data.types import (
+    ColdCluster,
+    HSSMState,
+    SemanticMemoryState,
+    SemanticReadResult,
+    SemanticSlot,
+)
 
 
 class SemanticMemory(nn.Module):
@@ -30,13 +36,36 @@ class SemanticMemory(nn.Module):
         )
         self.reset()
 
+    def init_state(self) -> SemanticMemoryState:
+        return SemanticMemoryState(
+            hot_slots={level: [] for level in range(self.hssm_config.num_levels)},
+            cold_clusters={level: [] for level in range(self.hssm_config.num_levels)},
+        )
+
     def reset(self) -> None:
-        self.hot_slots: dict[int, list[SemanticSlot]] = {
-            level: [] for level in range(self.hssm_config.num_levels)
+        self.load_state(self.init_state())
+
+    def load_state(self, state: SemanticMemoryState) -> None:
+        self.hot_slots = {
+            level: [self._clone_slot(slot) for slot in state.hot_slots.get(level, [])]
+            for level in range(self.hssm_config.num_levels)
         }
-        self.cold_clusters: dict[int, list[ColdCluster]] = {
-            level: [] for level in range(self.hssm_config.num_levels)
+        self.cold_clusters = {
+            level: [self._clone_cluster(cluster) for cluster in state.cold_clusters.get(level, [])]
+            for level in range(self.hssm_config.num_levels)
         }
+
+    def export_state(self) -> SemanticMemoryState:
+        return SemanticMemoryState(
+            hot_slots={
+                level: [self._clone_slot(slot) for slot in slots]
+                for level, slots in self.hot_slots.items()
+            },
+            cold_clusters={
+                level: [self._clone_cluster(cluster) for cluster in clusters]
+                for level, clusters in self.cold_clusters.items()
+            },
+        )
 
     def read_hot(
         self,
@@ -208,3 +237,21 @@ class SemanticMemory(nn.Module):
 
         group_ids = {id(slot) for slot in group}
         self.hot_slots[level] = [slot for slot in self.hot_slots[level] if id(slot) not in group_ids]
+
+    def _clone_slot(self, slot: SemanticSlot) -> SemanticSlot:
+        return SemanticSlot(
+            level=slot.level,
+            key=slot.key.detach().clone(),
+            value=slot.value.detach().clone(),
+            access_score=slot.access_score,
+            timestamp=slot.timestamp,
+        )
+
+    def _clone_cluster(self, cluster: ColdCluster) -> ColdCluster:
+        return ColdCluster(
+            level=cluster.level,
+            centroid=cluster.centroid.detach().clone(),
+            value=cluster.value.detach().clone(),
+            member_count=cluster.member_count,
+            last_updated=cluster.last_updated,
+        )

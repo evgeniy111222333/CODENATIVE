@@ -34,13 +34,20 @@ class CodeAwareEmbedding(nn.Module):
         self.struct_proj = nn.Linear(model_dim, model_dim)
         self.output_bias = nn.Parameter(torch.zeros(model_dim))
 
-    def forward(self, batch: PhaseABatch) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        batch: PhaseABatch,
+        position_offset: int = 0,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        shifted_positions = (batch.positions + position_offset).clamp(
+            max=self.position_embedding.num_embeddings - 1
+        )
         token_component = (
             self.token_embedding(batch.token_ids)
             + self.class_embedding(batch.token_class_ids)
             + self.language_embedding(batch.language_ids)
             + self.scope_embedding(batch.scope_ids)
-            + self.position_embedding(batch.positions)
+            + self.position_embedding(shifted_positions)
         )
 
         byte_emb = self.byte_embedding(batch.byte_values)

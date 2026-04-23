@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from htm_code_native.config.settings import HSSMConfig
+from htm_code_native.data.types import HSSMRuntimeState
 
 
 @dataclass(slots=True)
@@ -55,15 +56,37 @@ class HSSMCore(nn.Module):
             [HSSMLevelCell(config.hidden_size) for _ in range(config.num_levels)]
         )
 
-    def forward(self, embeddings: torch.Tensor, boundaries: dict[int, torch.Tensor]) -> HSSMRunOutput:
+    def init_runtime_state(self, device: torch.device | None = None) -> HSSMRuntimeState:
+        target_device = device or self.cells[0].update_gate.weight.device
+        return HSSMRuntimeState(
+            prev_states=[
+                torch.zeros(self.hidden_size, device=target_device)
+                for _ in range(self.config.num_levels)
+            ],
+            last_update_indices=[-1 for _ in range(self.config.num_levels)],
+            segment_start_indices=[0 for _ in range(self.config.num_levels)],
+            history_tails=[[] for _ in range(self.config.num_levels)],
+        )
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        boundaries: dict[int, torch.Tensor],
+        runtime_state: HSSMRuntimeState | None = None,
+        step_offset: int = 0,
+    ) -> HSSMRunOutput | tuple[HSSMRunOutput, HSSMRuntimeState]:
         seq_len, hidden_size = embeddings.shape
         device = embeddings.device
         num_levels = self.config.num_levels
 
-        histories: list[list[torch.Tensor]] = [[] for _ in range(num_levels)]
-        prev_states = [torch.zeros(hidden_size, device=device) for _ in range(num_levels)]
-        last_update_indices = [-1 for _ in range(num_levels)]
-        segment_starts = [0 for _ in range(num_levels)]
+        state = runtime_state or self.init_runtime_state(device=device)
+        histories = [
+            [value.detach().to(device) for value in level_history]
+            for level_history in state.history_tails
+        ]
+        prev_states = [value.detach().to(device) for value in state.prev_states]
+        last_update_indices = list(state.last_update_indices)
+        segment_starts = list(state.segment_start_indices)
 
         level_states = torch.zeros(seq_len, num_levels, hidden_size, device=device)
         master_states = torch.zeros(seq_len, num_levels * hidden_size, device=device)
@@ -71,6 +94,7 @@ class HSSMCore(nn.Module):
         lower_aggregates = torch.zeros(seq_len, num_levels, hidden_size, device=device)
 
         for step in range(seq_len):
+            global_step = step_offset + step
             new_states: list[torch.Tensor] = []
             for level in range(num_levels):
                 lower_input = (
@@ -80,7 +104,7 @@ class HSSMCore(nn.Module):
                         histories[level - 1],
                         new_states[level - 1],
                         segment_starts[level],
-                        step,
+                        global_step,
                         self._stride(level),
                     )
                 )
@@ -92,30 +116,42 @@ class HSSMCore(nn.Module):
                 )
                 _, proposed_state = self.cells[level](lower_input, upper_state, prev_states[level])
                 should_update = level == 0 or bool(boundaries[level][step].item()) or (
-                    step % self._stride(level) == 0
+                    global_step % self._stride(level) == 0
                 )
                 if should_update:
                     updated_state = self._project_norm(proposed_state)
                     prev_states[level] = updated_state
-                    last_update_indices[level] = step
+                    last_update_indices[level] = global_step
                     update_mask[step, level] = True
                 new_states.append(prev_states[level])
                 level_states[step, level] = prev_states[level]
 
             for level in range(num_levels):
-                histories[level].append(new_states[level])
+                histories[level].append(new_states[level].detach())
                 if bool(boundaries[level][step].item()):
-                    segment_starts[level] = step + 1
+                    segment_starts[level] = global_step + 1
 
             master_states[step] = torch.cat(new_states, dim=-1)
 
-        return HSSMRunOutput(
+        output = HSSMRunOutput(
             level_states=level_states,
             master_states=master_states,
             update_mask=update_mask,
             lower_aggregates=lower_aggregates,
             last_update_indices=last_update_indices,
         )
+        next_state = HSSMRuntimeState(
+            prev_states=[value.detach() for value in prev_states],
+            last_update_indices=last_update_indices,
+            segment_start_indices=segment_starts,
+            history_tails=[
+                [value.detach() for value in level_history]
+                for level_history in histories
+            ],
+        )
+        if runtime_state is None:
+            return output
+        return output, next_state
 
     def _stride(self, level: int) -> int:
         return self.config.stride_base**level
@@ -125,15 +161,17 @@ class HSSMCore(nn.Module):
         history: list[torch.Tensor],
         current_state: torch.Tensor,
         segment_start: int,
-        step: int,
+        global_step: int,
         stride: int,
     ) -> torch.Tensor:
         history_with_current = [*history, current_state]
-        fallback_start = max(0, step - stride + 1)
-        start = min(segment_start, step)
-        effective_start = start if start <= step else fallback_start
+        fallback_start = max(0, global_step - stride + 1)
+        start = min(segment_start, global_step)
+        effective_start = start if start <= global_step else fallback_start
         effective_start = max(fallback_start, effective_start)
-        segment = history_with_current[effective_start : step + 1]
+        history_base = max(0, global_step - len(history))
+        start_offset = max(effective_start - history_base, 0)
+        segment = history_with_current[start_offset : len(history_with_current)]
         if not segment:
             return current_state
         return torch.stack(segment, dim=0).mean(dim=0)

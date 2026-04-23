@@ -76,11 +76,18 @@ def graph_copy_loss(
     graph_logits: torch.Tensor | None,
     targets: torch.Tensor,
     graph_copy_target_mask: torch.Tensor | None,
+    graph_copy_target_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if graph_logits is None or graph_copy_target_mask is None or not bool(graph_copy_target_mask.any().item()):
         device = targets.device if isinstance(targets, torch.Tensor) else None
         return torch.tensor(0.0, device=device)
-    return F.nll_loss(graph_logits[graph_copy_target_mask], targets[graph_copy_target_mask])
+    effective_targets = targets if graph_copy_target_ids is None else graph_copy_target_ids
+    effective_mask = graph_copy_target_mask
+    if graph_copy_target_ids is not None:
+        effective_mask = effective_mask & (graph_copy_target_ids >= 0)
+        if not bool(effective_mask.any().item()):
+            return graph_logits.new_tensor(0.0)
+    return F.nll_loss(graph_logits[effective_mask], effective_targets[effective_mask])
 
 
 def symbol_link_loss(

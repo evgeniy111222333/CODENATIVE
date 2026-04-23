@@ -183,6 +183,7 @@ class PhaseABatch:
     registry_size: int
     vocabulary_snapshot: VocabularySnapshot
     document: AlignedDocument
+    task_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -191,6 +192,14 @@ class HSSMState:
     last_update_indices: list[int]
     master_state: torch.Tensor
     step_index: int
+
+
+@dataclass(slots=True)
+class HSSMRuntimeState:
+    prev_states: list[torch.Tensor]
+    last_update_indices: list[int]
+    segment_start_indices: list[int]
+    history_tails: list[list[torch.Tensor]]
 
 
 @dataclass(slots=True)
@@ -209,6 +218,12 @@ class ColdCluster:
     value: torch.Tensor
     member_count: int
     last_updated: int
+
+
+@dataclass(slots=True)
+class SemanticMemoryState:
+    hot_slots: dict[int, list[SemanticSlot]]
+    cold_clusters: dict[int, list[ColdCluster]]
 
 
 @dataclass(slots=True)
@@ -232,6 +247,15 @@ class ExactRecentSlot:
     byte_payload: bytes
     key: torch.Tensor
     timestamp: int
+
+
+@dataclass(slots=True)
+class ExactRecentMemoryState:
+    slots: list[ExactRecentSlot | None]
+    write_pointer: int
+    filled: int
+    total_writes: int
+    total_overwrites: int
 
 
 @dataclass(slots=True)
@@ -270,6 +294,13 @@ class EpisodicChunk:
     key: torch.Tensor
     pointer_keys: torch.Tensor
     metadata: EpisodicChunkMetadata
+
+
+@dataclass(slots=True)
+class ExactEpisodicMemoryState:
+    chunks: list[EpisodicChunk]
+    next_chunk_id: int
+    total_chunks_finalized: int
 
 
 @dataclass(slots=True)
@@ -364,6 +395,10 @@ class RepoGraphQueryContext:
     scope_path: tuple[str, ...]
     token_value: str
     token_class: str
+    probe_kind: str | None = None
+    target_symbol_name: str | None = None
+    target_token_value: str | None = None
+    target_copy_value: str | None = None
 
 
 @dataclass(slots=True)
@@ -412,6 +447,12 @@ class RouterWarmupState:
 
 
 @dataclass(slots=True)
+class RouterRuntimeState:
+    dominant_mass_history: tuple[float, ...]
+    recovery_steps_remaining: int
+
+
+@dataclass(slots=True)
 class RouterDecision:
     pre_logits: torch.Tensor
     expensive_probs: torch.Tensor
@@ -433,6 +474,19 @@ class RouterDecision:
 
 
 @dataclass(slots=True)
+class PhaseASessionState:
+    hssm: HSSMRuntimeState
+    semantic_memory: SemanticMemoryState
+    exact_recent: ExactRecentMemoryState
+    exact_episodic: ExactEpisodicMemoryState
+    router: RouterRuntimeState
+    stream_token_index: int
+    position_offset: int
+    current_chunk_start: int
+    previous_lane_stats: torch.Tensor
+
+
+@dataclass(slots=True)
 class PhaseAOutput:
     logits: torch.Tensor
     lm_logits: torch.Tensor
@@ -447,6 +501,7 @@ class PhaseAOutput:
     graph_logits: torch.Tensor | None
     graph_attention: torch.Tensor | None
     graph_copy_target_mask: torch.Tensor | None
+    graph_copy_target_ids: torch.Tensor | None
     base_hidden_states: torch.Tensor | None
     graph_contexts: torch.Tensor | None
     router_weights: torch.Tensor | None

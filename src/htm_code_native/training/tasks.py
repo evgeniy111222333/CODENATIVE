@@ -9,10 +9,14 @@ from htm_code_native.config.settings import HTMCodeNativeConfig
 from htm_code_native.data.featurizer import build_batch_from_document
 from htm_code_native.data.types import (
     AlignedDocument,
+    BoundaryEvents,
     CodeToken,
+    PhaseABatch,
+    SyntaxStateFeatures,
     TaskBatch,
     TaskExample,
     TaskLabel,
+    TokenStructureInfo,
     TrainingPhase,
 )
 from htm_code_native.data.vocabulary import VocabularyRegistry
@@ -127,6 +131,7 @@ def build_task_batch(
             "probe_kind": example.metadata.get("probe_kind"),
             "masked_token_range": (infill_start, infill_end),
         }
+        batch.task_metadata.update(metadata)
         return TaskBatch(
             example=example,
             batch=batch,
@@ -153,6 +158,19 @@ def build_task_batch(
             if supervision_index >= 0:
                 supervision_mask[supervision_index] = True
                 batch.targets[supervision_index] = replacement_token_id
+        _sync_batch_vocabulary(batch, active_registry)
+        batch.task_metadata.update(
+            {
+                "task_label": example.task_label.value,
+                "probe_kind": example.metadata.get("probe_kind", "edit_fix"),
+                "edit_target_span": (edit_start, edit_end),
+                "target_token_value": example.metadata.get("target_token_value"),
+                "replacement_text": replacement_text,
+                "replacement_token_id": replacement_token_id,
+                "instruction": example.metadata.get("instruction"),
+                "target_symbol": example.metadata.get("target_symbol"),
+            }
+        )
         return TaskBatch(
             example=example,
             batch=batch,
@@ -171,6 +189,20 @@ def build_task_batch(
 
     batch = build_batch_from_document(document, boundaries, config, registry=active_registry)
     supervision_mask = torch.ones(len(document.tokens), dtype=torch.bool)
+    replacement_text = example.metadata.get("replacement_text")
+    if replacement_text is not None:
+        active_registry.encode_token(str(replacement_text))
+        _sync_batch_vocabulary(batch, active_registry)
+    batch.task_metadata.update(
+        {
+            "task_label": example.task_label.value,
+            "probe_kind": example.metadata.get("probe_kind"),
+            "target_token_value": example.metadata.get("target_token_value"),
+            "replacement_text": replacement_text,
+            "instruction": example.metadata.get("instruction"),
+            "target_symbol": example.metadata.get("target_symbol"),
+        }
+    )
     return TaskBatch(
         example=example,
         batch=batch,
@@ -183,6 +215,11 @@ def build_task_batch(
             "probe_kind": example.metadata.get("probe_kind"),
         },
     )
+
+
+def _sync_batch_vocabulary(batch: PhaseABatch, registry: VocabularyRegistry) -> None:
+    batch.registry_size = registry.size
+    batch.vocabulary_snapshot = registry.snapshot()
 
 
 def default_task_examples(
@@ -219,21 +256,35 @@ def default_task_examples(
                 TaskLabel.REPO_GRAPH,
                 repo_root=resolved_repo_root,
                 report_paths=report_paths,
-                metadata={"probe_kind": "definition_use"},
+                metadata={
+                    "probe_kind": "definition_use",
+                    "target_token_value": "GRAPH_SHARED_NAME",
+                    "target_symbol": "GRAPH_SHARED_NAME",
+                },
             ),
             build_task_example(
                 str(repo_graph_path),
                 TaskLabel.REPO_GRAPH,
                 repo_root=resolved_repo_root,
                 report_paths=report_paths,
-                metadata={"probe_kind": "diagnostic_to_symbol"},
+                metadata={
+                    "probe_kind": "diagnostic_to_symbol",
+                    "target_token_value": "GRAPH_SHARED_NAME",
+                    "target_symbol": "GRAPH_SHARED_NAME",
+                },
             ),
             build_task_example(
                 str(repo_graph_path),
                 TaskLabel.REPO_GRAPH,
                 repo_root=resolved_repo_root,
                 report_paths=report_paths,
-                metadata={"probe_kind": "diagnostic_to_symbol"},
+                metadata={
+                    "probe_kind": "edit_fix",
+                    "target_token_value": "GRAPH_SHARED_NAME",
+                    "replacement_text": "\"shared_graph_token\"",
+                    "instruction": "Inline shared_graph_token expected by diagnostics in app/core.py",
+                    "target_symbol": "GRAPH_SHARED_NAME",
+                },
             ),
         ]
         examples.setdefault(TaskLabel.REPO_GRAPH, []).extend(repo_examples)
@@ -314,6 +365,42 @@ def flatten_examples(task_buckets: dict[TaskLabel, list[TaskExample]]) -> list[T
     return flattened
 
 
+def _slice_task_batch_window(task_batch: TaskBatch, start: int, end: int) -> TaskBatch:
+    batch = _slice_phase_a_batch_window(task_batch.batch, start, end)
+    supervision_mask = task_batch.supervision_mask[start:end].clone()
+    target_span = _slice_optional_span(task_batch.edit_target_span, start, end)
+    infill_span = _slice_optional_span(task_batch.infill_span, start, end)
+    metadata = dict(task_batch.metadata)
+    for key in ("edit_target_token_mask", "diagnostic_token_mask"):
+        value = metadata.get(key)
+        if isinstance(value, torch.Tensor) and value.shape[0] == task_batch.batch.token_ids.shape[0]:
+            metadata[key] = value[start:end].clone()
+    masked_range = metadata.get("masked_token_range")
+    if isinstance(masked_range, tuple) and len(masked_range) == 2:
+        metadata["masked_token_range"] = _slice_optional_span(masked_range, start, end)
+    return TaskBatch(
+        example=task_batch.example,
+        batch=batch,
+        supervision_mask=supervision_mask,
+        infill_span=infill_span,
+        edit_target_span=target_span,
+        replacement_text=task_batch.replacement_text,
+        metadata=metadata,
+    )
+
+
+def _iter_contiguous_task_windows(task_batch: TaskBatch, max_tokens: int) -> list[TaskBatch]:
+    if max_tokens <= 0 or task_batch.batch.token_ids.shape[0] <= max_tokens:
+        return [task_batch]
+    boundaries = _window_end_indices(task_batch.batch, max_tokens)
+    windows: list[TaskBatch] = []
+    start = 0
+    for end in boundaries:
+        windows.append(_slice_task_batch_window(task_batch, start, end))
+        start = end
+    return windows
+
+
 def _select_infill_span(document: AlignedDocument) -> tuple[int, int]:
     seq_len = len(document.tokens)
     if seq_len <= 2:
@@ -357,9 +444,23 @@ def _select_edit_target(
     if not replacement_text:
         replacement_text = "\"patched_value\""
     if target_value:
+        matches: list[tuple[float, int]] = []
         for token in document.tokens:
-            if token.value == target_value:
-                return token.index, token.index + 1, replacement_text
+            if token.value != target_value:
+                continue
+            structure = document.token_structures[token.index]
+            score = 0.0
+            if structure.scope_path:
+                score += 2.0
+            if structure.syntax_node_type == "identifier":
+                score += 1.0
+            if not {"import_statement", "import_from_statement"}.intersection(structure.ast_path):
+                score += 3.0
+            matches.append((score, token.index))
+        if matches:
+            matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            best_index = matches[0][1]
+            return best_index, best_index + 1, replacement_text
     target_symbol = str(example.metadata.get("target_symbol", "")).strip()
     if target_symbol:
         for symbol in document.symbols:
@@ -372,3 +473,117 @@ def _select_edit_target(
         if token.token_class.value == "identifier":
             return token.index, token.index + 1, replacement_text
     return 0, min(1, len(document.tokens)), replacement_text
+
+
+def _slice_phase_a_batch_window(batch: PhaseABatch, start: int, end: int) -> PhaseABatch:
+    seq_len = batch.token_ids.shape[0]
+    bounded_start = max(0, min(start, seq_len))
+    bounded_end = max(bounded_start + 1, min(end, seq_len))
+    sliced_document = _slice_aligned_document(batch.document, bounded_start, bounded_end)
+    byte_offset = int(batch.token_spans[bounded_start, 0].item())
+    return PhaseABatch(
+        token_ids=batch.token_ids[bounded_start:bounded_end].clone(),
+        token_class_ids=batch.token_class_ids[bounded_start:bounded_end].clone(),
+        language_ids=batch.language_ids[bounded_start:bounded_end].clone(),
+        scope_ids=batch.scope_ids[bounded_start:bounded_end].clone(),
+        positions=torch.arange(bounded_end - bounded_start, dtype=batch.positions.dtype),
+        byte_values=batch.byte_values[bounded_start:bounded_end].clone(),
+        byte_mask=batch.byte_mask[bounded_start:bounded_end].clone(),
+        ast_type_ids=batch.ast_type_ids[bounded_start:bounded_end].clone(),
+        ast_depth_ids=batch.ast_depth_ids[bounded_start:bounded_end].clone(),
+        ast_mask=batch.ast_mask[bounded_start:bounded_end].clone(),
+        symbol_ids=batch.symbol_ids[bounded_start:bounded_end].clone(),
+        file_ids=batch.file_ids[bounded_start:bounded_end].clone(),
+        token_spans=(batch.token_spans[bounded_start:bounded_end] - byte_offset).clone(),
+        token_payload_lengths=batch.token_payload_lengths[bounded_start:bounded_end].clone(),
+        boundaries={
+            level: values[bounded_start:bounded_end].clone()
+            for level, values in batch.boundaries.items()
+        },
+        targets=batch.targets[bounded_start:bounded_end].clone(),
+        registry_size=batch.registry_size,
+        vocabulary_snapshot=batch.vocabulary_snapshot,
+        document=sliced_document,
+        task_metadata=dict(batch.task_metadata),
+    )
+
+
+def _slice_aligned_document(document: AlignedDocument, start: int, end: int) -> AlignedDocument:
+    tokens = document.tokens[start:end]
+    if not tokens:
+        raise ValueError("Cannot slice an empty document window.")
+    raw_start = tokens[0].start_byte
+    raw_end = tokens[-1].end_byte
+    raw_bytes = document.raw_bytes[raw_start:raw_end]
+    shifted_tokens = [
+        replace(
+            token,
+            index=local_index,
+            start_byte=token.start_byte - raw_start,
+            end_byte=token.end_byte - raw_start,
+        )
+        for local_index, token in enumerate(tokens)
+    ]
+    shifted_structures = [
+        replace(structure, token_index=local_index)
+        for local_index, structure in enumerate(document.token_structures[start:end])
+    ]
+    shifted_syntax = [
+        replace(syntax, token_index=local_index)
+        for local_index, syntax in enumerate(document.syntax_features[start:end])
+    ]
+    byte_to_token_index = [-1] * len(raw_bytes)
+    for token in shifted_tokens:
+        for byte_index in range(token.start_byte, token.end_byte):
+            if 0 <= byte_index < len(byte_to_token_index):
+                byte_to_token_index[byte_index] = token.index
+    return replace(
+        document,
+        source_text=raw_bytes.decode("utf-8", errors="ignore"),
+        raw_bytes=raw_bytes,
+        tokens=shifted_tokens,
+        byte_to_token_index=byte_to_token_index,
+        token_structures=shifted_structures,
+        syntax_features=shifted_syntax,
+    )
+
+
+def _slice_optional_span(
+    span: tuple[int, int] | None,
+    start: int,
+    end: int,
+) -> tuple[int, int] | None:
+    if span is None:
+        return None
+    left = max(span[0], start)
+    right = min(span[1], end)
+    if left >= right:
+        return None
+    return left - start, right - start
+
+
+def _window_end_indices(batch: PhaseABatch, max_tokens: int) -> list[int]:
+    seq_len = batch.token_ids.shape[0]
+    if seq_len <= max_tokens:
+        return [seq_len]
+    candidate_levels = [4, 3, 2]
+    boundaries: list[int] = []
+    start = 0
+    while start < seq_len:
+        target = min(start + max_tokens, seq_len)
+        boundary_end = target
+        for level in candidate_levels:
+            mask = batch.boundaries.get(level)
+            if mask is None or target >= seq_len:
+                continue
+            for step in range(target - 1, start, -1):
+                if bool(mask[step].item()):
+                    boundary_end = step + 1
+                    break
+            if boundary_end != target:
+                break
+        if boundary_end <= start:
+            boundary_end = target
+        boundaries.append(boundary_end)
+        start = boundary_end
+    return boundaries
