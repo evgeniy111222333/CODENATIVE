@@ -1,6 +1,11 @@
 from htm_code_native.training.maintenance import schedule_maintenance, update_ar_ema
 from htm_code_native.training.optimizer import build_optimizer, clip_grad_groups
 from htm_code_native.training.probes import build_probe_examples, run_phase_exit_probes
+from htm_code_native.training.session import (
+    TaskSessionRunConfig,
+    TaskSessionRunResult,
+    run_task_batch_with_session,
+)
 from htm_code_native.training.tasks import (
     build_repo_graph_index,
     build_task_batch,
@@ -27,6 +32,9 @@ __all__ = [
     "infer_task_label",
     "resolve_repo_root",
     "run_phase_exit_probes",
+    "run_task_batch_with_session",
     "schedule_maintenance",
+    "TaskSessionRunConfig",
+    "TaskSessionRunResult",
     "update_ar_ema",
 ]

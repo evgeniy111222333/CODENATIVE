@@ -15,8 +15,12 @@ import torch
 from htm_code_native.cli import build_repo_graph_index, load_config
 from htm_code_native.data.types import PhaseABatch, RepositoryGraphIndex, TaskLabel, TrainingPhase
 from htm_code_native.model.phase_a import PhaseACodeModel
-from htm_code_native.training import build_task_batch, build_task_example
-from htm_code_native.training.tasks import _iter_contiguous_task_windows
+from htm_code_native.training import (
+    TaskSessionRunConfig,
+    build_task_batch,
+    build_task_example,
+    run_task_batch_with_session,
+)
 
 
 def _mean_target_probability(output, batch, token_class: str) -> float:
@@ -166,7 +170,7 @@ def main() -> int:
             )
             task_batch = build_task_batch(example, config)
             batch = task_batch.batch
-    windows = _iter_contiguous_task_windows(task_batch, args.chunk_size) if args.chunk_size > 0 else [task_batch]
+    effective_chunk_size = args.chunk_size if args.chunk_size > 0 else config.model.semantic_session_chunk_size
     model = PhaseACodeModel(config)
     model.set_repo_graph_index(graph_index)
     model.eval()
@@ -175,19 +179,17 @@ def main() -> int:
     iterations = max(args.iterations, 1)
     for _ in range(warmup):
         with torch.no_grad():
-            if len(windows) == 1:
-                model(batch, phase=phase, task_label=task_label)
-                continue
-            session_state = model.init_session_state(device=batch.token_ids.device)
-            for window_index, window in enumerate(windows):
-                _, session_state = model.forward_with_session(
-                    window.batch,
-                    session_state=session_state,
+            run_task_batch_with_session(
+                model,
+                task_batch,
+                config,
+                TaskSessionRunConfig(
+                    chunk_size=effective_chunk_size,
+                    maintenance_budget=config.semantic_memory.maintenance_budget,
                     phase=phase,
                     task_label=task_label,
-                    global_step=window_index,
-                    maintenance_budget=1.0,
-                )
+                ),
+            )
 
     start = time.perf_counter()
     hot_reads = 0.0
@@ -197,6 +199,10 @@ def main() -> int:
     erm_writes = 0.0
     erm_overwrites = 0.0
     copy_hits = 0.0
+    exact_payload_recall = 0.0
+    exact_span_recall = 0.0
+    exact_recent_payload_hits = 0.0
+    exact_episodic_payload_hits = 0.0
     episodic_hits = 0.0
     identifier_recall = 0.0
     string_recall = 0.0
@@ -224,21 +230,19 @@ def main() -> int:
     tokens = 0
     for _ in range(iterations):
         with torch.no_grad():
-            if len(windows) == 1:
-                outputs = [model(batch, phase=phase, task_label=task_label)]
-            else:
-                outputs = []
-                session_state = model.init_session_state(device=batch.token_ids.device)
-                for window_index, window in enumerate(windows):
-                    output, session_state = model.forward_with_session(
-                        window.batch,
-                        session_state=session_state,
-                        phase=phase,
-                        task_label=task_label,
-                        global_step=window_index,
-                        maintenance_budget=1.0,
-                    )
-                    outputs.append(output)
+            session_result = run_task_batch_with_session(
+                model,
+                task_batch,
+                config,
+                TaskSessionRunConfig(
+                    chunk_size=effective_chunk_size,
+                    maintenance_budget=config.semantic_memory.maintenance_budget,
+                    phase=phase,
+                    task_label=task_label,
+                ),
+            )
+            outputs = session_result.outputs
+            windows = session_result.windows
         for window_index, (window, output) in enumerate(zip(windows, outputs, strict=False)):
             window_batch = window.batch
             hot_reads += output.memory_stats["hot_reads"]
@@ -248,6 +252,14 @@ def main() -> int:
             erm_writes += output.memory_stats["erm_writes"]
             erm_overwrites += output.memory_stats["erm_overwrites"]
             copy_hits += output.memory_stats["copy_target_hits"]
+            exact_payload_recall += float(
+                output.auxiliary["phase_exit_probe_metrics"]["exact_payload_recall"]
+            )
+            exact_span_recall += float(
+                output.auxiliary["phase_exit_probe_metrics"]["exact_span_recall"]
+            )
+            exact_recent_payload_hits += float(output.memory_stats["exact_recent_payload_hits"])
+            exact_episodic_payload_hits += float(output.memory_stats["exact_episodic_payload_hits"])
             episodic_hits += output.memory_stats["episodic_target_hits"]
             identifier_recall += _mean_target_probability(output, window_batch, "identifier")
             string_recall += _mean_target_probability(output, window_batch, "string")
@@ -298,7 +310,7 @@ def main() -> int:
     print(
         {
             "file": args.file_path,
-            "chunk_size": args.chunk_size,
+            "chunk_size": effective_chunk_size,
             "session_window_count": len(windows),
             "tokens_per_sec": tokens / max(elapsed, 1e-6),
             "avg_hot_reads": hot_reads / iterations,
@@ -308,6 +320,10 @@ def main() -> int:
             "avg_erm_writes": erm_writes / iterations,
             "avg_erm_overwrites": erm_overwrites / iterations,
             "avg_copy_target_hits": copy_hits / iterations,
+            "exact_payload_recall": exact_payload_recall / max(total_windows, 1.0),
+            "exact_span_recall": exact_span_recall / max(total_windows, 1.0),
+            "avg_exact_recent_payload_hits": exact_recent_payload_hits / iterations,
+            "avg_exact_episodic_payload_hits": exact_episodic_payload_hits / iterations,
             "avg_episodic_target_hits": episodic_hits / iterations,
             "repeated_identifier_recall": identifier_recall / iterations,
             "repeated_string_recall": string_recall / iterations,

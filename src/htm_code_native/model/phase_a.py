@@ -11,6 +11,7 @@ from torch import nn
 from htm_code_native.config.settings import HTMCodeNativeConfig
 from htm_code_native.data.types import (
     ExactEpisodicReadResult,
+    ExactPayloadCandidate,
     ExactRecentReadResult,
     HSSMState,
     PhaseABatch,
@@ -203,6 +204,7 @@ class PhaseACodeModel(nn.Module):
         self.exact_episodic_memory.load_state(session_state.exact_episodic)
         self.repo_graph_memory.reset()
         self.router.load_state(session_state.router)
+        initial_cold_cluster_count = self._semantic_cold_cluster_count()
 
         seq_len = embeddings.shape[0]
         num_levels = self.config.hssm.num_levels
@@ -232,6 +234,8 @@ class PhaseACodeModel(nn.Module):
         episodic_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         graph_copy_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         graph_copy_target_ids = torch.full((seq_len,), fill_value=-1, dtype=torch.long, device=device)
+        exact_payload_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        exact_span_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         graph_supervision_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         entropy_tensor = torch.zeros(seq_len, num_levels, device=device)
         lane_entropies = torch.zeros(seq_len, 5, device=device)
@@ -254,6 +258,13 @@ class PhaseACodeModel(nn.Module):
         total_erm_writes = 0
         total_erm_overwrites = 0
         copy_target_hits = 0
+        exact_payload_candidate_steps = 0
+        exact_byte_candidate_hits = 0
+        exact_span_candidate_hits = 0
+        exact_recent_payload_hits = 0
+        exact_episodic_payload_hits = 0
+        exact_recent_payload_candidates = 0
+        exact_episodic_payload_candidates = 0
         total_eem_reads = 0
         total_chunks_finalized = 0
         total_chunk_overhead = 0.0
@@ -277,6 +288,9 @@ class PhaseACodeModel(nn.Module):
         diagnostic_copy_steps = 0
         edit_fix_copy_steps = 0
         cold_semantic_invocations = 0
+        cold_read_enabled_steps = 0
+        maintenance_budgeted_steps = 0
+        maintenance_effective_steps = 0
         eem_invocations = 0
         graph_invocations = 0
         symbol_link_hits = 0
@@ -297,6 +311,9 @@ class PhaseACodeModel(nn.Module):
         graph_candidate_scores: list[torch.Tensor] = []
         graph_target_node_ids: list[str | None] = []
         graph_supervision_modes: list[str] = []
+        exact_recent_payload_candidates_by_step: list[tuple[ExactPayloadCandidate, ...]] = []
+        exact_episodic_payload_candidates_by_step: list[tuple[ExactPayloadCandidate, ...]] = []
+        exact_payload_target_bytes: list[bytes | None] = []
         route_teacher_indices: list[int] = []
         route_teacher_expensive: list[tuple[int, int, int]] = []
         router_pre_logits: list[torch.Tensor] = []
@@ -328,6 +345,7 @@ class PhaseACodeModel(nn.Module):
             cold_available = phase_policy["cold_semantic_enabled"] and any(
                 self.semantic_memory.cold_clusters[level] for level in range(num_levels)
             )
+            cold_read_enabled_steps += int(cold_available)
             erm_enabled = phase_policy["erm_enabled"]
             eem_enabled = phase_policy["eem_enabled"]
             if not eem_enabled:
@@ -470,6 +488,10 @@ class PhaseACodeModel(nn.Module):
             pointer_attention[step] = exact_episodic_result.pointer_attention
             total_eem_reads += exact_episodic_result.read_count
             total_chunk_overhead += exact_episodic_result.chunk_overhead
+            exact_recent_payload_candidates_by_step.append(exact_recent_result.payload_candidates)
+            exact_episodic_payload_candidates_by_step.append(exact_episodic_result.payload_candidates)
+            exact_recent_payload_candidates += len(exact_recent_result.payload_candidates)
+            exact_episodic_payload_candidates += len(exact_episodic_result.payload_candidates)
 
             graph_logits[step] = graph_result.log_distribution
             graph_attention[step] = graph_result.attention
@@ -536,6 +558,26 @@ class PhaseACodeModel(nn.Module):
             graph_copy_present = False
             if step < seq_len - 1:
                 target_token_id = int(batch.targets[step].item())
+                target_payload = self._target_payload_bytes(batch, step + 1)
+                exact_payload_target_bytes.append(target_payload)
+                if target_payload:
+                    exact_payload_candidate_steps += 1
+                    payload_metrics = self._exact_payload_candidate_metrics(
+                        target_token_id=target_token_id,
+                        target_payload=target_payload,
+                        candidates=(
+                            *exact_recent_result.payload_candidates,
+                            *exact_episodic_result.payload_candidates,
+                        ),
+                    )
+                    if payload_metrics["payload_hit"]:
+                        exact_payload_target_mask[step] = True
+                        exact_byte_candidate_hits += 1
+                    if payload_metrics["span_hit"]:
+                        exact_span_target_mask[step] = True
+                        exact_span_candidate_hits += 1
+                    exact_recent_payload_hits += int(payload_metrics["recent_payload_hit"])
+                    exact_episodic_payload_hits += int(payload_metrics["episodic_payload_hit"])
                 has_copy_target = bool((exact_recent_result.slot_token_ids == target_token_id).any().item())
                 copy_target_mask[step] = has_copy_target
                 copy_target_hits += int(has_copy_target)
@@ -607,6 +649,7 @@ class PhaseACodeModel(nn.Module):
                 route_teacher_indices.append(teacher_index)
                 route_teacher_expensive.append(teacher_expensive)
             else:
+                exact_payload_target_bytes.append(None)
                 graph_supervision_modes.append("none")
                 graph_target_node_ids.append(None)
                 route_teacher_indices.append(0)
@@ -697,6 +740,7 @@ class PhaseACodeModel(nn.Module):
 
             self.semantic_memory.write_hot(step_state)
             if maintenance_budget > 0.0:
+                maintenance_budgeted_steps += 1
                 with torch.no_grad():
                     step_maintenance = self.semantic_memory.consolidate(
                         maintenance_budget,
@@ -704,6 +748,7 @@ class PhaseACodeModel(nn.Module):
                     )
             else:
                 step_maintenance = 0
+            maintenance_effective_steps += int(step_maintenance > 0)
             total_maintenance += step_maintenance
             total_hot_reads += hot_reads
             total_cold_reads += cold_reads
@@ -743,16 +788,28 @@ class PhaseACodeModel(nn.Module):
             len(self.semantic_memory.hot_slots[level]) / max(self.config.semantic_memory.hot_slots, 1)
             for level in range(self.config.hssm.num_levels)
         ) / max(self.config.hssm.num_levels, 1)
+        semantic_cold_cluster_count = self._semantic_cold_cluster_count()
+        cold_clusters_created = max(0, semantic_cold_cluster_count - initial_cold_cluster_count)
         memory_stats = {
             "hot_reads": float(total_hot_reads),
             "cold_reads": float(total_cold_reads),
             "hot_occupancy": float(hot_occupancy),
             "maintenance_invocations": float(total_maintenance),
+            "maintenance_budgeted_steps": float(maintenance_budgeted_steps),
+            "maintenance_effective_steps": float(maintenance_effective_steps),
+            "maintenance_blocked_steps": float(max(maintenance_budgeted_steps - maintenance_effective_steps, 0)),
             "erm_reads": float(total_erm_reads),
             "erm_writes": float(total_erm_writes),
             "erm_fill": float(self.exact_recent_memory.filled),
             "erm_overwrites": float(total_erm_overwrites),
             "copy_target_hits": float(copy_target_hits),
+            "exact_payload_candidate_steps": float(exact_payload_candidate_steps),
+            "exact_byte_candidate_hits": float(exact_byte_candidate_hits),
+            "exact_span_candidate_hits": float(exact_span_candidate_hits),
+            "exact_recent_payload_hits": float(exact_recent_payload_hits),
+            "exact_episodic_payload_hits": float(exact_episodic_payload_hits),
+            "exact_recent_payload_candidates": float(exact_recent_payload_candidates),
+            "exact_episodic_payload_candidates": float(exact_episodic_payload_candidates),
             "eem_reads": float(total_eem_reads),
             "chunks_finalized": float(total_chunks_finalized),
             "stored_chunks": float(len(self.exact_episodic_memory.chunks)),
@@ -771,6 +828,9 @@ class PhaseACodeModel(nn.Module):
             "graph_task_eligible_steps": float(graph_task_eligible_steps),
             "graph_supervision_steps": float(graph_supervision_steps),
             "cold_semantic_invocations": float(cold_semantic_invocations),
+            "cold_read_enabled_steps": float(cold_read_enabled_steps),
+            "cold_clusters_created": float(cold_clusters_created),
+            "semantic_cold_clusters": float(semantic_cold_cluster_count),
             "eem_invocations": float(eem_invocations),
             "graph_invocations": float(graph_invocations),
             "symbol_link_hits": float(symbol_link_hits),
@@ -797,6 +857,10 @@ class PhaseACodeModel(nn.Module):
         phase_exit_probe_metrics = {
             "recent_copy_hit_rate": float(copy_target_hits / max(seq_len - 1, 1)),
             "episodic_hit_rate": float(episodic_target_hits / max(seq_len - 1, 1)),
+            "exact_payload_recall": float(exact_byte_candidate_hits / max(exact_payload_candidate_steps, 1)),
+            "exact_span_recall": float(exact_span_candidate_hits / max(exact_payload_candidate_steps, 1)),
+            "exact_recent_payload_recall": float(exact_recent_payload_hits / max(exact_payload_candidate_steps, 1)),
+            "exact_episodic_payload_recall": float(exact_episodic_payload_hits / max(exact_payload_candidate_steps, 1)),
             "graph_copy_hit_rate": float(graph_copy_hits / max(graph_copy_supervision_steps, 1)),
             "symbol_link_hit_rate": float(symbol_link_hits / max(graph_supervision_steps, 1)),
             "graph_supervision_count": float(graph_supervision_steps),
@@ -841,6 +905,8 @@ class PhaseACodeModel(nn.Module):
             graph_attention=graph_attention,
             graph_copy_target_mask=graph_copy_target_mask,
             graph_copy_target_ids=graph_copy_target_ids,
+            exact_payload_target_mask=exact_payload_target_mask,
+            exact_span_target_mask=exact_span_target_mask,
             base_hidden_states=base_hidden_states,
             graph_contexts=graph_contexts,
             router_weights=router_weights,
@@ -874,6 +940,9 @@ class PhaseACodeModel(nn.Module):
                 "graph_candidate_scores": graph_candidate_scores,
                 "graph_target_node_ids": graph_target_node_ids,
                 "graph_copy_target_ids": graph_copy_target_ids,
+                "exact_recent_payload_candidates": exact_recent_payload_candidates_by_step,
+                "exact_episodic_payload_candidates": exact_episodic_payload_candidates_by_step,
+                "exact_payload_target_bytes": exact_payload_target_bytes,
                 "graph_supervision_mask": graph_supervision_mask,
                 "graph_supervision_mode": graph_supervision_modes,
                 "graph_supervision_count": float(graph_supervision_steps),
@@ -927,6 +996,9 @@ class PhaseACodeModel(nn.Module):
             dim=0,
         )
         return torch.sum(gamma.unsqueeze(-1) * projected_outputs, dim=0)
+
+    def _semantic_cold_cluster_count(self) -> int:
+        return sum(len(clusters) for clusters in self.semantic_memory.cold_clusters.values())
 
     def _graph_query_context(self, batch: PhaseABatch, step: int) -> RepoGraphQueryContext:
         structure = batch.document.token_structures[step]
@@ -1343,6 +1415,36 @@ class PhaseACodeModel(nn.Module):
         text = str(value).strip()
         return text or None
 
+    def _target_payload_bytes(self, batch: PhaseABatch, target_index: int) -> bytes:
+        if target_index < 0 or target_index >= len(batch.document.tokens):
+            return b""
+        payload_length = int(batch.token_payload_lengths[target_index].item())
+        return batch.document.token_bytes(target_index)[:payload_length]
+
+    def _exact_payload_candidate_metrics(
+        self,
+        *,
+        target_token_id: int,
+        target_payload: bytes,
+        candidates: tuple[ExactPayloadCandidate, ...],
+    ) -> dict[str, bool]:
+        matching_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.token_id == target_token_id and candidate.byte_payload == target_payload
+        ]
+        payload_hit = bool(matching_candidates)
+        span_hit = any(
+            candidate.start_byte >= 0 and candidate.end_byte > candidate.start_byte
+            for candidate in matching_candidates
+        )
+        return {
+            "payload_hit": payload_hit,
+            "span_hit": span_hit,
+            "recent_payload_hit": any(candidate.source == "exact_recent" for candidate in matching_candidates),
+            "episodic_payload_hit": any(candidate.source == "exact_episodic" for candidate in matching_candidates),
+        }
+
     def _empty_erm_result(self, device: torch.device) -> ExactRecentReadResult:
         return ExactRecentReadResult(
             distribution=torch.zeros(self.config.model.vocabulary_size, device=device),
@@ -1358,6 +1460,7 @@ class PhaseACodeModel(nn.Module):
                 dtype=torch.long,
                 device=device,
             ),
+            payload_candidates=(),
             filled_size=0,
             read_count=0,
             write_count=0,
@@ -1389,6 +1492,7 @@ class PhaseACodeModel(nn.Module):
                 dtype=torch.long,
                 device=device,
             ),
+            payload_candidates=(),
             retrieved_chunk_count=0,
             read_count=0,
             chunks_finalized=self.exact_episodic_memory.total_chunks_finalized,

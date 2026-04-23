@@ -142,8 +142,16 @@ def test_eem_retrieval_returns_pointer_mass_for_matching_token() -> None:
     result = memory.retrieve(torch.tensor([1.0, 0.0, 0.0, 0.0]))
     alpha_id = int(batch.token_ids[0].item())
     beta_id = int(batch.token_ids[1].item())
+    alpha_candidates = [
+        candidate
+        for candidate in result.payload_candidates
+        if candidate.token_id == alpha_id and candidate.byte_payload == b"alpha"
+    ]
     assert result.retrieved_chunk_count == 1
     assert result.distribution[alpha_id].item() > result.distribution[beta_id].item()
+    assert alpha_candidates
+    assert all(candidate.chunk_id == 0 for candidate in alpha_candidates)
+    assert any(candidate.start_byte == 0 and candidate.end_byte == 5 for candidate in alpha_candidates)
     loss = episodic_pointer_loss(
         result.log_distribution.unsqueeze(0),
         torch.tensor([alpha_id]),

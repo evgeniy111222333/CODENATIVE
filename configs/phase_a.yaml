@@ -79,8 +79,11 @@ model:
   maintenance_cadence: 16
   maintenance_ema_decay: 0.9
   maintenance_loss_spike_delta: 0.05
+  semantic_session_chunk_size: 64
+  semantic_maintenance_warmup_steps: 0
   probe_min_tokens_per_sec: 5.0
   probe_max_energy_proxy: 20.0
+  probe_min_cold_read_rate: 0.01
   probe_min_recent_copy_hit_rate: 0.01
   probe_min_episodic_hit_rate: 0.01
   probe_min_symbol_link_hit_rate: 0.01

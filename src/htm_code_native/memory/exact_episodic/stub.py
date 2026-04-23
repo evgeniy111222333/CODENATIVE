@@ -12,6 +12,7 @@ from htm_code_native.data.types import (
     EpisodicChunkMetadata,
     ExactEpisodicMemoryState,
     ExactEpisodicReadResult,
+    ExactPayloadCandidate,
     PhaseABatch,
 )
 
@@ -148,6 +149,7 @@ class ExactEpisodicMemory(nn.Module):
                 pointer_attention=pointer_attention,
                 retrieved_chunk_ids=retrieved_chunk_ids,
                 pointer_token_ids=pointer_token_ids,
+                payload_candidates=(),
                 retrieved_chunk_count=0,
                 read_count=0,
                 chunks_finalized=self.total_chunks_finalized,
@@ -172,6 +174,7 @@ class ExactEpisodicMemory(nn.Module):
         pointer_query = self.pointer_query_projection(hidden)
         pointer_scores_list: list[torch.Tensor] = []
         pointer_token_id_list: list[int] = []
+        pointer_candidate_metadata: list[tuple[EpisodicChunk, int, int, int, bytes]] = []
         fill_index = 0
         for chunk_weight, chunk in zip(top_weights, selected_chunks, strict=False):
             keys = chunk.pointer_keys.to(device)
@@ -179,6 +182,22 @@ class ExactEpisodicMemory(nn.Module):
             scores = scores + torch.log(chunk_weight.clamp_min(1e-8))
             pointer_scores_list.append(scores)
             pointer_token_id_list.extend(list(chunk.token_ids))
+            chunk_raw_start = chunk.token_spans[0][0] if chunk.token_spans else 0
+            for chunk_token_index, token_id in enumerate(chunk.token_ids):
+                if chunk_token_index >= len(chunk.token_spans):
+                    continue
+                start_byte, end_byte = chunk.token_spans[chunk_token_index]
+                local_start = max(start_byte - chunk_raw_start, 0)
+                local_end = max(end_byte - chunk_raw_start, local_start)
+                pointer_candidate_metadata.append(
+                    (
+                        chunk,
+                        chunk_token_index,
+                        start_byte,
+                        end_byte,
+                        chunk.raw_bytes[local_start:local_end],
+                    )
+                )
             usable = min(len(chunk.token_ids), self.max_chunk_tokens)
             pointer_token_ids[fill_index : fill_index + usable] = torch.tensor(
                 list(chunk.token_ids[:usable]),
@@ -197,6 +216,21 @@ class ExactEpisodicMemory(nn.Module):
         log_distribution = torch.log(distribution.clamp_min(1e-8))
         usable_pointer_count = min(pointer_attention.shape[0], flat_weights.shape[0])
         pointer_attention[:usable_pointer_count] = flat_weights[:usable_pointer_count]
+        payload_candidates = tuple(
+            ExactPayloadCandidate(
+                source="exact_episodic",
+                token_id=int(chunk.token_ids[chunk_token_index]),
+                start_byte=start_byte,
+                end_byte=end_byte,
+                byte_payload=byte_payload,
+                score=float(flat_weights[index].detach().item()),
+                chunk_id=chunk.chunk_id,
+                chunk_token_index=chunk_token_index,
+            )
+            for index, (chunk, chunk_token_index, start_byte, end_byte, byte_payload) in enumerate(
+                pointer_candidate_metadata[: flat_weights.shape[0]]
+            )
+        )
 
         return ExactEpisodicReadResult(
             distribution=distribution,
@@ -205,6 +239,7 @@ class ExactEpisodicMemory(nn.Module):
             pointer_attention=pointer_attention,
             retrieved_chunk_ids=retrieved_chunk_ids,
             pointer_token_ids=pointer_token_ids,
+            payload_candidates=payload_candidates,
             retrieved_chunk_count=top_k,
             read_count=int(flat_weights.shape[0]),
             chunks_finalized=self.total_chunks_finalized,
@@ -292,6 +327,7 @@ class NoOpExactEpisodicMemory:
             pointer_attention=torch.zeros(1, device=device),
             retrieved_chunk_ids=torch.full((1,), fill_value=-1, dtype=torch.long, device=device),
             pointer_token_ids=torch.full((1,), fill_value=-1, dtype=torch.long, device=device),
+            payload_candidates=(),
             retrieved_chunk_count=0,
             read_count=0,
             chunks_finalized=0,

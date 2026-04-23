@@ -43,6 +43,9 @@ def test_exact_recent_ring_wraparound_and_payload_truncation() -> None:
     assert result.write_count == 3
     assert result.overwrite_count == 1
     assert result.slot_token_ids.tolist()[:2] == [8, 9]
+    assert result.payload_candidates[1].token_id == 9
+    assert result.payload_candidates[1].byte_payload == b"klmn"
+    assert result.payload_candidates[1].start_byte == 10
     assert memory.slots[(memory.write_pointer - 1) % memory.window_size].byte_payload == b"klmn"
 
 
@@ -68,3 +71,9 @@ def test_exact_recent_repeated_tokens_accumulate_copy_mass() -> None:
 
     assert torch.isclose(result.attention[:3].sum(), torch.tensor(1.0))
     assert result.distribution[7].item() > result.distribution[3].item()
+    alpha_payloads = [
+        candidate.byte_payload
+        for candidate in result.payload_candidates
+        if candidate.token_id == 7
+    ]
+    assert alpha_payloads == [b"a", b"a"]

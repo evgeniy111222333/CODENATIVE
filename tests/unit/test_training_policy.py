@@ -22,6 +22,7 @@ def test_optimizer_groups_and_router_warmup_lr(config) -> None:
 
 
 def test_maintenance_scheduler_blocks_warmup_and_loss_spike(config) -> None:
+    config.model.semantic_maintenance_warmup_steps = 8
     warmup_decision = schedule_maintenance(
         1,
         {"hot_occupancy": 1.0, "ar_loss": 0.5, "ar_ema": 0.5},
@@ -31,7 +32,16 @@ def test_maintenance_scheduler_blocks_warmup_and_loss_spike(config) -> None:
     assert warmup_decision.should_consolidate is False
     assert warmup_decision.reason == "under_warmup"
 
-    step_index = config.model.router_warmup_steps + config.model.maintenance_cadence
+    config.model.semantic_maintenance_warmup_steps = 0
+    early_decision = schedule_maintenance(
+        1,
+        {"hot_occupancy": 1.0, "ar_loss": 0.5, "ar_ema": 0.5},
+        config,
+        TrainingPhase.PHASE_D,
+    )
+    assert early_decision.reason == "cadence_miss"
+
+    step_index = config.model.maintenance_cadence
     spike_decision = schedule_maintenance(
         step_index,
         {

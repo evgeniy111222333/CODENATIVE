@@ -6,7 +6,12 @@ from typing import Protocol
 import torch
 from torch import nn
 
-from htm_code_native.data.types import ExactRecentMemoryState, ExactRecentReadResult, ExactRecentSlot
+from htm_code_native.data.types import (
+    ExactPayloadCandidate,
+    ExactRecentMemoryState,
+    ExactRecentReadResult,
+    ExactRecentSlot,
+)
 
 
 class ExactRecentMemoryAdapter(Protocol):
@@ -118,6 +123,7 @@ class ExactRecentMemory(nn.Module):
                 log_distribution=log_distribution,
                 attention=attention,
                 slot_token_ids=slot_token_ids,
+                payload_candidates=(),
                 filled_size=0,
                 read_count=0,
                 write_count=self.total_writes,
@@ -133,12 +139,25 @@ class ExactRecentMemory(nn.Module):
         log_distribution = torch.log(distribution.clamp_min(1e-8))
         attention[: len(ordered_slots)] = weights
         slot_token_ids[: len(ordered_slots)] = token_ids
+        payload_candidates = tuple(
+            ExactPayloadCandidate(
+                source="exact_recent",
+                token_id=slot.token_id,
+                start_byte=slot.start_byte,
+                end_byte=slot.end_byte,
+                byte_payload=slot.byte_payload,
+                score=float(weights[index].detach().item()),
+                slot_index=index,
+            )
+            for index, slot in enumerate(ordered_slots)
+        )
 
         return ExactRecentReadResult(
             distribution=distribution,
             log_distribution=log_distribution,
             attention=attention,
             slot_token_ids=slot_token_ids,
+            payload_candidates=payload_candidates,
             filled_size=len(ordered_slots),
             read_count=len(ordered_slots),
             write_count=self.total_writes,
@@ -188,6 +207,7 @@ class NoOpExactRecentMemory:
             log_distribution=torch.zeros(1, device=device),
             attention=torch.zeros(1, device=device),
             slot_token_ids=torch.full((1,), fill_value=-1, dtype=torch.long, device=device),
+            payload_candidates=(),
             filled_size=0,
             read_count=0,
             write_count=0,

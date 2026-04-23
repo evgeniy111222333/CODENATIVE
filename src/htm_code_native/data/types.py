@@ -259,11 +259,25 @@ class ExactRecentMemoryState:
 
 
 @dataclass(slots=True)
+class ExactPayloadCandidate:
+    source: str
+    token_id: int
+    start_byte: int
+    end_byte: int
+    byte_payload: bytes
+    score: float
+    slot_index: int | None = None
+    chunk_id: int | None = None
+    chunk_token_index: int | None = None
+
+
+@dataclass(slots=True)
 class ExactRecentReadResult:
     distribution: torch.Tensor
     log_distribution: torch.Tensor
     attention: torch.Tensor
     slot_token_ids: torch.Tensor
+    payload_candidates: tuple[ExactPayloadCandidate, ...]
     filled_size: int
     read_count: int
     write_count: int
@@ -311,6 +325,7 @@ class ExactEpisodicReadResult:
     pointer_attention: torch.Tensor
     retrieved_chunk_ids: torch.Tensor
     pointer_token_ids: torch.Tensor
+    payload_candidates: tuple[ExactPayloadCandidate, ...]
     retrieved_chunk_count: int
     read_count: int
     chunks_finalized: int
@@ -502,6 +517,8 @@ class PhaseAOutput:
     graph_attention: torch.Tensor | None
     graph_copy_target_mask: torch.Tensor | None
     graph_copy_target_ids: torch.Tensor | None
+    exact_payload_target_mask: torch.Tensor | None
+    exact_span_target_mask: torch.Tensor | None
     base_hidden_states: torch.Tensor | None
     graph_contexts: torch.Tensor | None
     router_weights: torch.Tensor | None

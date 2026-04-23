@@ -104,10 +104,17 @@ def test_recent_copy_mask_and_logits_are_emitted(build_batch, config) -> None:
     model = PhaseACodeModel(config)
     output = model(batch)
     assert bool(output.copy_target_mask.any().item()) is True
+    assert output.exact_payload_target_mask is not None
+    assert output.exact_span_target_mask is not None
+    assert bool(output.exact_payload_target_mask.any().item()) is True
+    assert output.memory_stats["exact_byte_candidate_hits"] > 0
+    assert output.memory_stats["exact_span_candidate_hits"] > 0
+    assert output.auxiliary["phase_exit_probe_metrics"]["exact_payload_recall"] > 0.0
     matching_steps = output.copy_target_mask.nonzero(as_tuple=False).flatten()
     first_step = int(matching_steps[0].item())
     target_id = int(batch.targets[first_step].item())
     assert output.erm_logits[first_step, target_id].exp().item() > 0.0
+    assert output.auxiliary["exact_recent_payload_candidates"][first_step]
 
 
 def test_eem_outputs_and_chunk_stats_are_emitted(build_batch, config) -> None:
@@ -119,6 +126,8 @@ def test_eem_outputs_and_chunk_stats_are_emitted(build_batch, config) -> None:
     assert output.memory_stats["eem_reads"] >= 0
     assert output.eem_logits is not None
     assert output.pointer_attention is not None
+    assert output.memory_stats["exact_episodic_payload_candidates"] > 0
+    assert any(output.auxiliary["exact_episodic_payload_candidates"])
 
 
 def test_graph_outputs_and_stats_are_emitted(build_batch, config) -> None:

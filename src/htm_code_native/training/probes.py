@@ -11,6 +11,7 @@ from htm_code_native.editing.planner import build_edit_request, run_edit_plan
 from htm_code_native.losses.core import autoregressive_loss, masked_autoregressive_loss
 from htm_code_native.model.phase_a import PhaseACodeModel
 from htm_code_native.training.metrics import has_invalid_number, safe_delta, safe_mean
+from htm_code_native.training.session import TaskSessionRunConfig, run_task_batch_with_session
 from htm_code_native.training.tasks import (
     build_repo_graph_index,
     build_task_batch,
@@ -63,10 +64,18 @@ def run_phase_exit_probes(
         "ar_loss_mean": [],
         "recent_copy_hit_rate": [],
         "episodic_hit_rate": [],
+        "exact_payload_recall": [],
+        "exact_span_recall": [],
+        "exact_recent_payload_recall": [],
+        "exact_episodic_payload_recall": [],
         "graph_copy_hit_rate": [],
         "symbol_link_hit_rate": [],
         "route_entropy": [],
         "energy_proxy": [],
+        "cold_read_rate": [],
+        "semantic_cold_clusters": [],
+        "cold_semantic_invocation_rate": [],
+        "cold_session_delta_vs_stateless": [],
         "graph_supervision_count": [],
         "definition_use_hit_rate": [],
         "diagnostic_link_hit_rate": [],
@@ -132,6 +141,18 @@ def run_phase_exit_probes(
             metrics_accumulator["episodic_hit_rate"].append(
                 float(output.auxiliary["phase_exit_probe_metrics"]["episodic_hit_rate"])
             )
+            metrics_accumulator["exact_payload_recall"].append(
+                float(output.auxiliary["phase_exit_probe_metrics"]["exact_payload_recall"])
+            )
+            metrics_accumulator["exact_span_recall"].append(
+                float(output.auxiliary["phase_exit_probe_metrics"]["exact_span_recall"])
+            )
+            metrics_accumulator["exact_recent_payload_recall"].append(
+                float(output.auxiliary["phase_exit_probe_metrics"]["exact_recent_payload_recall"])
+            )
+            metrics_accumulator["exact_episodic_payload_recall"].append(
+                float(output.auxiliary["phase_exit_probe_metrics"]["exact_episodic_payload_recall"])
+            )
             metrics_accumulator["graph_copy_hit_rate"].append(
                 float(output.auxiliary["phase_exit_probe_metrics"]["graph_copy_hit_rate"])
             )
@@ -190,6 +211,15 @@ def run_phase_exit_probes(
                 metrics_accumulator["best_patch_hit_rate"].append(planner_metrics["best_patch_hit_rate"])
                 metrics_accumulator["diagnostic_to_span_recall"].append(planner_metrics["diagnostic_to_span_recall"])
 
+        cold_metrics = _cold_semantic_probe_metrics(
+            model=model,
+            probe_examples=probe_examples,
+            config=config,
+            phase=phase,
+        )
+        for name, value in cold_metrics.items():
+            metrics_accumulator[name].append(value)
+
     elapsed = time.perf_counter() - start
     token_count = sum(len(build_task_batch(example, config).batch.document.tokens) for example in examples)
     aggregate_metrics = {name: safe_mean(values) for name, values in metrics_accumulator.items()}
@@ -206,6 +236,8 @@ def run_phase_exit_probes(
     if phase in {TrainingPhase.PHASE_B, TrainingPhase.PHASE_C, TrainingPhase.PHASE_D, TrainingPhase.PHASE_E}:
         if aggregate_metrics["recent_copy_hit_rate"] < config.model.probe_min_recent_copy_hit_rate:
             failing_checks.append("recent_copy_below_threshold")
+        if aggregate_metrics["cold_read_rate"] < config.model.probe_min_cold_read_rate:
+            failing_checks.append("cold_read_below_threshold")
     if phase in {TrainingPhase.PHASE_C, TrainingPhase.PHASE_D, TrainingPhase.PHASE_E}:
         if aggregate_metrics["episodic_hit_rate"] < config.model.probe_min_episodic_hit_rate:
             failing_checks.append("episodic_below_threshold")
@@ -303,6 +335,61 @@ def _probe_priority(example: TaskExample, phase: TrainingPhase) -> tuple[int, in
 
 def _example_uses_edit_planner(example: TaskExample) -> bool:
     return example.task_label == TaskLabel.EDIT_FIX or str(example.metadata.get("probe_kind", "")).strip() == "edit_fix"
+
+
+def _cold_semantic_probe_metrics(
+    *,
+    model: PhaseACodeModel,
+    probe_examples: list[TaskExample],
+    config: HTMCodeNativeConfig,
+    phase: TrainingPhase,
+) -> dict[str, float]:
+    if phase == TrainingPhase.PHASE_A:
+        return {
+            "cold_read_rate": 0.0,
+            "semantic_cold_clusters": 0.0,
+            "cold_semantic_invocation_rate": 0.0,
+            "cold_session_delta_vs_stateless": 0.0,
+        }
+    example = next((candidate for candidate in probe_examples if candidate.task_label == TaskLabel.AR), None)
+    if example is None:
+        return {
+            "cold_read_rate": 0.0,
+            "semantic_cold_clusters": 0.0,
+            "cold_semantic_invocation_rate": 0.0,
+            "cold_session_delta_vs_stateless": 0.0,
+        }
+    cold_model = PhaseACodeModel(config)
+    cold_model.load_state_dict(model.state_dict())
+    cold_model.eval()
+    task_batch = build_task_batch(example, config, registry=VocabularyRegistry(config.model.vocabulary_size))
+    session_result = run_task_batch_with_session(
+        cold_model,
+        task_batch,
+        config,
+        TaskSessionRunConfig(
+            chunk_size=config.model.semantic_session_chunk_size,
+            maintenance_budget=config.semantic_memory.maintenance_budget,
+            phase=phase,
+            task_label=TaskLabel.AR,
+        ),
+    )
+    stateless_output = cold_model(
+        task_batch.batch,
+        reset_eem=True,
+        phase=phase,
+        task_label=TaskLabel.AR,
+        maintenance_budget=0.0,
+    )
+    token_count = float(len(task_batch.batch.document.tokens))
+    stateless_rate = float(stateless_output.memory_stats["cold_reads"]) / max(token_count, 1.0)
+    session_rate = float(session_result.aggregate_metrics["cold_read_rate"])
+    return {
+        "cold_read_rate": session_rate,
+        "semantic_cold_clusters": float(session_result.aggregate_metrics["semantic_cold_clusters"]),
+        "cold_semantic_invocation_rate": float(session_result.aggregate_metrics["cold_semantic_invocation_rate"]),
+        "cold_session_delta_vs_stateless": safe_delta(session_rate, stateless_rate),
+    }
 
 
 def _build_probe_edit_request(example: TaskExample, config: HTMCodeNativeConfig):

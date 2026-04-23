@@ -107,8 +107,11 @@ class PhaseAModelConfig:
     maintenance_cadence: int = 16
     maintenance_ema_decay: float = 0.9
     maintenance_loss_spike_delta: float = 0.05
+    semantic_session_chunk_size: int = 64
+    semantic_maintenance_warmup_steps: int = 0
     probe_min_tokens_per_sec: float = 5.0
     probe_max_energy_proxy: float = 20.0
+    probe_min_cold_read_rate: float = 0.01
     probe_min_recent_copy_hit_rate: float = 0.01
     probe_min_episodic_hit_rate: float = 0.01
     probe_min_symbol_link_hit_rate: float = 0.01

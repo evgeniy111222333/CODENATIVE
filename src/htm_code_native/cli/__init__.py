@@ -364,6 +364,12 @@ def command_smoke_train(args: argparse.Namespace) -> int:
         maintenance_budget = (
             config.semantic_memory.maintenance_budget if maintenance_decision.should_consolidate else 0.0
         )
+        if (
+            maintenance_budget <= 0.0
+            and phase in {TrainingPhase.PHASE_B, TrainingPhase.PHASE_C, TrainingPhase.PHASE_D, TrainingPhase.PHASE_E}
+            and config.model.semantic_session_chunk_size > 0
+        ):
+            maintenance_budget = config.semantic_memory.maintenance_budget
 
         optimizer.zero_grad()
         output = model(

@@ -20,7 +20,8 @@ def schedule_maintenance(
     ar_loss = float(metrics.get("ar_loss", 0.0))
     ar_ema = float(metrics.get("ar_ema", ar_loss))
     ar_delta = abs(ar_loss - ar_ema)
-    under_warmup = step_index <= config.model.router_warmup_steps
+    warmup_steps = max(config.model.semantic_maintenance_warmup_steps, 0)
+    under_warmup = step_index < warmup_steps
     cadence = max(config.model.maintenance_cadence, 1)
     cadence_hit = step_index > 0 and (step_index % cadence == 0)
 
