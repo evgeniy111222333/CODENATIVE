@@ -24,6 +24,22 @@ class TokenClass(str, Enum):
     FALLBACK_BYTE_PIECE = "fallback-byte-piece"
 
 
+class TrainingPhase(str, Enum):
+    PHASE_A = "phase_a"
+    PHASE_B = "phase_b"
+    PHASE_C = "phase_c"
+    PHASE_D = "phase_d"
+    PHASE_E = "phase_e"
+
+
+class TaskLabel(str, Enum):
+    AR = "ar"
+    INFILL = "infill"
+    RECENT_COPY = "recent_copy"
+    EPISODIC_RECALL = "episodic_recall"
+    REPO_GRAPH = "repo_graph"
+
+
 @dataclass(slots=True)
 class CodeToken:
     index: int
@@ -377,6 +393,21 @@ class RouterFeatures:
     pre_features: torch.Tensor
     post_features: torch.Tensor
     availability_mask: torch.Tensor
+    phase: TrainingPhase
+    task_label: TaskLabel
+    step_index: int
+    oracle_availability: torch.Tensor | None = None
+    always_on_pre_mask: torch.Tensor | None = None
+    allowed_post_mask: torch.Tensor | None = None
+
+
+@dataclass(slots=True)
+class RouterWarmupState:
+    step_index: int
+    beta: float
+    active: bool
+    collapse_detected: bool
+    recovery_steps_remaining: int
 
 
 @dataclass(slots=True)
@@ -389,6 +420,15 @@ class RouterDecision:
     post_mask: torch.Tensor
     energy_proxy: torch.Tensor
     always_on_energy: torch.Tensor
+    oracle_weights: torch.Tensor
+    effective_weights: torch.Tensor
+    warmup_beta: float
+    warmup_active: bool
+    dominant_lane_dropped: bool
+    collapse_detected: bool
+    router_entropy: float
+    dominant_lane_mass: float
+    warmup_steps_remaining: int
 
 
 @dataclass(slots=True)
@@ -409,13 +449,69 @@ class PhaseAOutput:
     base_hidden_states: torch.Tensor | None
     graph_contexts: torch.Tensor | None
     router_weights: torch.Tensor | None
+    effective_router_weights: torch.Tensor | None
+    oracle_router_weights: torch.Tensor | None
+    oracle_availability: torch.Tensor | None
     router_pre_mask: torch.Tensor | None
     router_post_mask: torch.Tensor | None
     lane_entropies: torch.Tensor | None
     invoked_lanes: torch.Tensor | None
     energy_proxy: torch.Tensor | None
+    warmup_beta: torch.Tensor | None
+    collapse_detected: torch.Tensor | None
+    phase_name: str | None
+    task_label: str | None
     hidden_states: torch.Tensor
     semantic_contexts: torch.Tensor
     diagnostics: dict[str, float]
     memory_stats: dict[str, float]
     auxiliary: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class TaskExample:
+    file_path: str
+    task_label: TaskLabel
+    repo_root: str | None = None
+    report_paths: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class TaskBatch:
+    example: TaskExample
+    batch: PhaseABatch
+    supervision_mask: torch.Tensor
+    infill_span: tuple[int, int] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class MaintenanceDecision:
+    should_consolidate: bool
+    hot_occupancy: float
+    ar_ema: float
+    ar_delta: float
+    cadence_hit: bool
+    under_warmup: bool
+    reason: str
+    maintenance_invocations: int = 0
+
+
+@dataclass(slots=True)
+class TrainingStepResult:
+    example: TaskExample
+    output: PhaseAOutput
+    losses: dict[str, float]
+    gradient_norms: dict[str, float]
+    maintenance_decision: MaintenanceDecision
+
+
+@dataclass(slots=True)
+class PhaseExitReport:
+    phase: str
+    probe_set: str
+    passed: bool
+    metrics: dict[str, float]
+    failing_checks: tuple[str, ...] = ()
+    example_count: int = 0

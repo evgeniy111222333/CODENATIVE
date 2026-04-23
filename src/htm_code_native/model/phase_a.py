@@ -8,7 +8,20 @@ import torch
 from torch import nn
 
 from htm_code_native.config.settings import HTMCodeNativeConfig
-from htm_code_native.data.types import HSSMState, PhaseABatch, PhaseAOutput, RepoGraphQueryContext, RepositoryGraphIndex, RouterFeatures, TokenClass
+from htm_code_native.data.types import (
+    ExactEpisodicReadResult,
+    ExactRecentReadResult,
+    HSSMState,
+    PhaseABatch,
+    PhaseAOutput,
+    RepoGraphQueryContext,
+    RepoGraphReadResult,
+    RepositoryGraphIndex,
+    RouterFeatures,
+    TaskLabel,
+    TokenClass,
+    TrainingPhase,
+)
 from htm_code_native.encoders.code import CodeAwareEmbedding
 from htm_code_native.hssm.core import HSSMCore
 from htm_code_native.memory.exact_episodic import ExactEpisodicMemory
@@ -83,6 +96,19 @@ class PhaseACodeModel(nn.Module):
                 config.model.lane_cost_eem,
                 config.model.lane_cost_graph,
             ),
+            warmup_steps=config.model.router_warmup_steps,
+            oracle_sharpness=config.model.router_oracle_sharpness,
+            oracle_biases=(
+                config.model.router_oracle_bias_lm,
+                config.model.router_oracle_bias_semantic,
+                config.model.router_oracle_bias_erm,
+                config.model.router_oracle_bias_eem,
+                config.model.router_oracle_bias_graph,
+            ),
+            lane_dropout_prob=config.model.router_lane_dropout_prob,
+            collapse_mass_threshold=config.model.router_collapse_mass_threshold,
+            collapse_window=config.model.router_collapse_window,
+            recovery_steps=config.model.router_recovery_steps,
         )
 
         self.master_norm = nn.LayerNorm(master_dim)
@@ -111,7 +137,17 @@ class PhaseACodeModel(nn.Module):
         self.repo_graph_memory.set_index(index)
         self.repo_graph_root = Path(index.root_path).resolve() if index is not None else None
 
-    def forward(self, batch: PhaseABatch, reset_eem: bool = True) -> PhaseAOutput:
+    def forward(
+        self,
+        batch: PhaseABatch,
+        reset_eem: bool = True,
+        phase: TrainingPhase | str | None = None,
+        task_label: TaskLabel | str | None = None,
+        global_step: int = 0,
+        maintenance_budget: float = 0.0,
+    ) -> PhaseAOutput:
+        phase_name = self._resolve_phase(phase)
+        task_name = self._resolve_task_label(batch, task_label)
         embeddings, encoder_parts = self.encoder(batch)
         hssm_output = self.hssm(embeddings, batch.boundaries)
         self.semantic_memory.reset()
@@ -151,10 +187,15 @@ class PhaseACodeModel(nn.Module):
         entropy_tensor = torch.zeros(seq_len, num_levels, device=device)
         lane_entropies = torch.zeros(seq_len, 5, device=device)
         router_weights = torch.zeros(seq_len, 5, device=device)
+        effective_router_weights = torch.zeros(seq_len, 5, device=device)
+        oracle_router_weights = torch.zeros(seq_len, 5, device=device)
+        oracle_availability = torch.zeros(seq_len, 5, dtype=torch.bool, device=device)
         router_pre_mask = torch.zeros(seq_len, 6, dtype=torch.bool, device=device)
         router_post_mask = torch.zeros(seq_len, 5, dtype=torch.bool, device=device)
         invoked_lanes = torch.zeros(seq_len, 6, dtype=torch.bool, device=device)
         energy_proxy = torch.zeros(seq_len, device=device)
+        warmup_beta = torch.ones(seq_len, device=device)
+        collapse_detected = torch.zeros(seq_len, dtype=torch.bool, device=device)
 
         total_hot_reads = 0
         total_cold_reads = 0
@@ -176,10 +217,14 @@ class PhaseACodeModel(nn.Module):
         total_graph_diagnostic_hits = 0
         graph_copy_hits = 0
         graph_fusion_steps = 0
+        graph_task_eligible_steps = 0
         cold_semantic_invocations = 0
         eem_invocations = 0
         graph_invocations = 0
         symbol_link_hits = 0
+        warmup_active_steps = 0
+        dominant_lane_drop_steps = 0
+        router_collapse_steps = 0
         current_chunk_start = 0
         previous_lane_stats = torch.zeros(5, device=device)
         graph_candidate_ids: list[tuple[str, ...]] = []
@@ -191,6 +236,10 @@ class PhaseACodeModel(nn.Module):
         route_teacher_expensive: list[tuple[int, int, int]] = []
         router_pre_logits: list[torch.Tensor] = []
         router_post_logits: list[torch.Tensor] = []
+        router_post_masks: list[torch.Tensor] = []
+        oracle_router_weight_list: list[torch.Tensor] = []
+        warmup_steps_remaining = 0
+        phase_policy = self._phase_policy(phase_name)
 
         for step in range(seq_len):
             step_level_states = [
@@ -210,15 +259,26 @@ class PhaseACodeModel(nn.Module):
                 + self.skip_projection(hssm_output.level_states[step, 0])
             )
 
-            cold_available = any(self.semantic_memory.cold_clusters[level] for level in range(num_levels))
-            eem_available = bool(self.exact_episodic_memory.chunks)
+            cold_available = phase_policy["cold_semantic_enabled"] and any(
+                self.semantic_memory.cold_clusters[level] for level in range(num_levels)
+            )
+            erm_enabled = phase_policy["erm_enabled"]
+            eem_enabled = phase_policy["eem_enabled"]
+            if not eem_enabled:
+                current_chunk_start = step + 1
+            eem_available = eem_enabled and bool(self.exact_episodic_memory.chunks)
             graph_available = bool(self.repo_graph_memory.index and self.repo_graph_memory.index.nodes)
+            graph_task_relevant = graph_available and self._graph_task_is_relevant(batch, step)
+            graph_enabled = phase_policy["graph_enabled"] and graph_task_relevant
+            if phase_name == TrainingPhase.PHASE_D:
+                graph_enabled = graph_enabled and task_name == TaskLabel.REPO_GRAPH
+            graph_task_eligible_steps += int(graph_task_relevant)
             metadata = self._router_metadata(
                 batch=batch,
                 step=step,
                 token_counts=token_counts,
                 previous_lane_stats=previous_lane_stats,
-                availability=(cold_available, eem_available, graph_available),
+                availability=(cold_available, eem_available, graph_enabled),
             )
             pre_features = torch.cat(
                 [self.master_norm(step_state.master_state), base_hidden, metadata],
@@ -228,41 +288,32 @@ class PhaseACodeModel(nn.Module):
             cold_context = torch.zeros(hidden_size, device=device)
             cold_entropies: dict[int, float] = {level: 0.0 for level in range(num_levels)}
             cold_reads = 0
-            graph_result = self.repo_graph_memory.query(
-                hidden=torch.zeros(hidden_size, device=device),
-                context=self._graph_query_context(batch, step),
-                vocabulary_snapshot=batch.vocabulary_snapshot,
-            ) if False else None
-            zero_graph_distribution = torch.zeros(self.config.model.vocabulary_size, device=device)
-            zero_graph_log_distribution = torch.full(
-                (self.config.model.vocabulary_size,),
-                fill_value=math.log(1e-8),
-                device=device,
-            )
 
             availability_mask = torch.tensor(
-                [cold_available, eem_available, graph_available],
+                [cold_available, eem_available, graph_enabled],
                 dtype=torch.bool,
                 device=device,
             )
-            placeholder_post_features = torch.cat(
-                [
-                    self.master_norm(step_state.master_state),
-                    base_hidden,
-                    metadata,
-                    torch.zeros(5, device=device),
-                ],
-                dim=-1,
+            pre_router_features = RouterFeatures(
+                pre_features=pre_features,
+                post_features=torch.zeros(
+                    self.master_norm(step_state.master_state).shape[0] + hidden_size + self.router_metadata_dim + 5,
+                    device=device,
+                ),
+                availability_mask=availability_mask,
+                phase=phase_name,
+                task_label=task_name,
+                step_index=global_step,
+                always_on_pre_mask=phase_policy["always_on_pre_mask"].to(device),
+                allowed_post_mask=phase_policy["allowed_post_mask"].to(device),
             )
-            router_decision = self.router.route(
-                RouterFeatures(
-                    pre_features=pre_features,
-                    post_features=placeholder_post_features,
-                    availability_mask=availability_mask,
-                )
+            warmup_flag = self.training and phase_policy["warmup_enabled"] and global_step < self.config.model.router_warmup_steps
+            pre_logits, _expensive_probs, pre_mask, base_energy_proxy, _always_on_energy = self.router.route_pre(
+                pre_router_features,
+                warmup_active=warmup_flag,
             )
 
-            if bool(router_decision.pre_mask[3].item()) and cold_available:
+            if bool(pre_mask[3].item()) and cold_available:
                 cold_outputs, cold_entropies, cold_reads = self.semantic_memory.read_cold(step_state)
                 cold_context = self._aggregate_semantic_context(step_state.master_state, cold_outputs)
                 cold_semantic_invocations += 1
@@ -272,7 +323,7 @@ class PhaseACodeModel(nn.Module):
             graph_query_hidden = self.graph_query_projection(
                 torch.cat([base_hidden, encoder_parts["struct_component"][step]], dim=-1)
             )
-            if bool(router_decision.pre_mask[5].item()) and graph_available:
+            if bool(pre_mask[5].item()) and graph_enabled:
                 graph_result = self.repo_graph_memory.query(
                     hidden=graph_query_hidden,
                     context=self._graph_query_context(batch, step),
@@ -281,11 +332,11 @@ class PhaseACodeModel(nn.Module):
                 graph_invocations += 1
                 graph_fusion_steps += int(graph_result.retrieved_count > 0)
             else:
-                graph_result = None
+                graph_result = self._empty_graph_result(device)
 
             graph_context = (
                 graph_result.graph_context
-                if graph_result is not None and graph_result.retrieved_count > 0
+                if graph_result.retrieved_count > 0
                 else torch.zeros(self.config.model.graph_value_dim, device=device)
             )
             semantic_context = hot_context + cold_context + (
@@ -306,81 +357,74 @@ class PhaseACodeModel(nn.Module):
                 step_semantic_logits = None
                 semantic_probabilities = None
 
-            payload_length = int(batch.token_payload_lengths[step].item())
-            token_span = batch.token_spans[step].tolist()
-            payload = batch.document.token_bytes(step)[:payload_length]
-            overwrite = self.exact_recent_memory.write(
-                step_state=hssm_output.level_states[step, 0],
-                token_id=int(batch.token_ids[step].item()),
-                span=(int(token_span[0]), int(token_span[1])),
-                payload=payload,
-                timestamp=step,
-            )
-            exact_recent_result = self.exact_recent_memory.read(hidden)
-            total_erm_reads += exact_recent_result.read_count
-            total_erm_writes += 1
-            total_erm_overwrites += int(overwrite)
+            if erm_enabled:
+                payload_length = int(batch.token_payload_lengths[step].item())
+                token_span = batch.token_spans[step].tolist()
+                payload = batch.document.token_bytes(step)[:payload_length]
+                overwrite = self.exact_recent_memory.write(
+                    step_state=hssm_output.level_states[step, 0],
+                    token_id=int(batch.token_ids[step].item()),
+                    span=(int(token_span[0]), int(token_span[1])),
+                    payload=payload,
+                    timestamp=step,
+                )
+                exact_recent_result = self.exact_recent_memory.read(hidden)
+                total_erm_reads += exact_recent_result.read_count
+                total_erm_writes += 1
+                total_erm_overwrites += int(overwrite)
+            else:
+                exact_recent_result = self._empty_erm_result(device)
             erm_logits[step] = exact_recent_result.log_distribution
             erm_attention[step] = exact_recent_result.attention
 
-            chunk_type = self._chunk_type_for_step(batch, step, current_chunk_start)
-            if chunk_type is not None:
-                finalized_chunk = self.exact_episodic_memory.maybe_finalize_chunk(
-                    document=batch.document,
-                    batch=batch,
-                    level0_states=hssm_output.level_states[:, 0],
-                    start_index=current_chunk_start,
-                    end_index=step,
-                    chunk_type=chunk_type,
-                    timestamp=step,
-                )
-                if finalized_chunk is not None:
-                    total_chunks_finalized += 1
-                    current_chunk_start = step + 1
+            if eem_enabled:
+                chunk_type = self._chunk_type_for_step(batch, step, current_chunk_start)
+                if chunk_type is not None:
+                    finalized_chunk = self.exact_episodic_memory.maybe_finalize_chunk(
+                        document=batch.document,
+                        batch=batch,
+                        level0_states=hssm_output.level_states[:, 0],
+                        start_index=current_chunk_start,
+                        end_index=step,
+                        chunk_type=chunk_type,
+                        timestamp=step,
+                    )
+                    if finalized_chunk is not None:
+                        total_chunks_finalized += 1
+                        current_chunk_start = step + 1
 
-            if bool(router_decision.pre_mask[4].item()) and bool(self.exact_episodic_memory.chunks):
+            if bool(pre_mask[4].item()) and eem_available:
                 exact_episodic_result = self.exact_episodic_memory.retrieve(hidden)
-                eem_invocations += 1
+                if eem_enabled:
+                    eem_invocations += 1
             else:
-                exact_episodic_result = self.exact_episodic_memory.retrieve(
-                    torch.zeros_like(hidden)
-                ) if False else self._empty_eem_result(device)
+                exact_episodic_result = self._empty_eem_result(device)
             eem_logits[step] = exact_episodic_result.log_distribution
             eem_attention[step] = exact_episodic_result.chunk_attention
             pointer_attention[step] = exact_episodic_result.pointer_attention
             total_eem_reads += exact_episodic_result.read_count
             total_chunk_overhead += exact_episodic_result.chunk_overhead
 
-            if graph_result is not None:
-                graph_logits[step] = graph_result.log_distribution
-                graph_attention[step] = graph_result.attention
-                graph_candidate_ids.append(graph_result.candidate_node_ids)
-                graph_candidate_kinds.append(graph_result.candidate_kinds)
-                graph_candidate_names.append(graph_result.candidate_names)
-                graph_candidate_scores.append(graph_result.candidate_scores)
-                total_graph_reads += graph_result.read_count
-                total_graph_candidates += graph_result.candidate_count
-                total_graph_samefile_hits += graph_result.samefile_hits
-                total_graph_import_hits += graph_result.import_hits
-                total_graph_symbol_hits += graph_result.symbol_hits
-                total_graph_test_hits += graph_result.test_hits
-                total_graph_diagnostic_hits += graph_result.diagnostic_hits
-            else:
-                graph_logits[step] = zero_graph_log_distribution
-                graph_attention[step] = torch.zeros(self.config.model.graph_top_k, device=device)
-                graph_candidate_ids.append(())
-                graph_candidate_kinds.append(())
-                graph_candidate_names.append(())
-                graph_candidate_scores.append(torch.zeros(0, device=device))
+            graph_logits[step] = graph_result.log_distribution
+            graph_attention[step] = graph_result.attention
+            graph_candidate_ids.append(graph_result.candidate_node_ids)
+            graph_candidate_kinds.append(graph_result.candidate_kinds)
+            graph_candidate_names.append(graph_result.candidate_names)
+            graph_candidate_scores.append(graph_result.candidate_scores)
+            total_graph_reads += graph_result.read_count
+            total_graph_candidates += graph_result.candidate_count
+            total_graph_samefile_hits += graph_result.samefile_hits
+            total_graph_import_hits += graph_result.import_hits
+            total_graph_symbol_hits += graph_result.symbol_hits
+            total_graph_test_hits += graph_result.test_hits
+            total_graph_diagnostic_hits += graph_result.diagnostic_hits
 
             semantic_entropy_value = self._distribution_entropy(
                 semantic_probabilities if semantic_probabilities is not None else lm_probabilities
             )
             erm_entropy_value = self._distribution_entropy(exact_recent_result.distribution)
             eem_entropy_value = self._distribution_entropy(exact_episodic_result.distribution)
-            graph_entropy_value = self._distribution_entropy(
-                graph_result.distribution if graph_result is not None else zero_graph_distribution
-            )
+            graph_entropy_value = self._distribution_entropy(graph_result.distribution)
             lm_entropy_value = self._distribution_entropy(lm_probabilities)
             lane_entropy = torch.tensor(
                 [
@@ -404,51 +448,23 @@ class PhaseACodeModel(nn.Module):
                 ],
                 dim=-1,
             )
-            router_decision = self.router.route(
-                RouterFeatures(
-                    pre_features=pre_features,
-                    post_features=post_features,
-                    availability_mask=availability_mask,
-                )
+            post_router_features = RouterFeatures(
+                pre_features=pre_features,
+                post_features=post_features,
+                availability_mask=availability_mask,
+                phase=phase_name,
+                task_label=task_name,
+                step_index=global_step,
+                always_on_pre_mask=phase_policy["always_on_pre_mask"].to(device),
+                allowed_post_mask=phase_policy["allowed_post_mask"].to(device),
             )
-            router_pre_logits.append(router_decision.pre_logits)
-            router_post_logits.append(router_decision.post_logits)
-            router_pre_mask[step] = router_decision.pre_mask
-            invoked_lanes[step] = router_decision.pre_mask
-            router_post_mask[step] = router_decision.post_mask
-            router_weights[step] = router_decision.weights
-            energy_proxy[step] = router_decision.energy_proxy + (
-                self.config.model.maintenance_cost * 0.0
-            )
-
-            blended_probabilities = (
-                router_decision.weights[0] * lm_probabilities
-                + router_decision.weights[1]
-                * (
-                    semantic_probabilities
-                    if semantic_probabilities is not None
-                    else lm_probabilities
-                )
-                + router_decision.weights[2] * exact_recent_result.distribution
-                + router_decision.weights[3] * exact_episodic_result.distribution
-                + router_decision.weights[4]
-                * (
-                    graph_result.distribution
-                    if graph_result is not None
-                    else zero_graph_distribution
-                )
-            )
-            logits[step] = torch.log(blended_probabilities.clamp_min(1e-8))
-
-            lm_logits[step] = step_lm_logits
-            base_hidden_states[step] = base_hidden
-            hidden_states[step] = hidden
-            semantic_contexts[step] = semantic_context
-            graph_contexts[step] = graph_context
 
             for level in range(num_levels):
                 entropy_tensor[step, level] = hot_entropies.get(level, 0.0) + cold_entropies.get(level, 0.0)
 
+            has_copy_target = False
+            has_episodic_target = False
+            graph_target_node_id = None
             if step < seq_len - 1:
                 target_token_id = int(batch.targets[step].item())
                 has_copy_target = bool((exact_recent_result.slot_token_ids == target_token_id).any().item())
@@ -462,18 +478,16 @@ class PhaseACodeModel(nn.Module):
                 episodic_target_hits += int(has_episodic_target)
 
                 next_structure = batch.document.token_structures[step + 1]
-                graph_target_node_id = None
-                if graph_result is not None:
-                    has_graph_copy = bool((graph_result.copy_token_ids == target_token_id).any().item())
-                    graph_copy_target_mask[step] = has_graph_copy
-                    graph_copy_hits += int(has_graph_copy)
-                    graph_target_node_id = self._resolve_graph_target_node(
-                        next_structure.symbol_id,
-                        next_structure.symbol_name,
-                        graph_result.candidate_node_ids,
-                        graph_result.candidate_names,
-                    )
-                    symbol_link_hits += int(graph_target_node_id is not None)
+                has_graph_copy = bool((graph_result.copy_token_ids == target_token_id).any().item())
+                graph_copy_target_mask[step] = has_graph_copy
+                graph_copy_hits += int(has_graph_copy)
+                graph_target_node_id = self._resolve_graph_target_node(
+                    next_structure.symbol_id,
+                    next_structure.symbol_name,
+                    graph_result.candidate_node_ids,
+                    graph_result.candidate_names,
+                )
+                symbol_link_hits += int(graph_target_node_id is not None)
                 graph_target_node_ids.append(graph_target_node_id)
 
                 teacher_index, teacher_expensive = self._route_teacher(
@@ -482,6 +496,7 @@ class PhaseACodeModel(nn.Module):
                     copy_hit=has_copy_target,
                     episodic_hit=has_episodic_target,
                     graph_hit=bool(graph_copy_target_mask[step].item()) or graph_target_node_id is not None,
+                    phase=phase_name,
                 )
                 route_teacher_indices.append(teacher_index)
                 route_teacher_expensive.append(teacher_expensive)
@@ -489,31 +504,127 @@ class PhaseACodeModel(nn.Module):
                 graph_target_node_ids.append(None)
                 route_teacher_indices.append(0)
                 route_teacher_expensive.append((0, 0, 0))
+                graph_copy_target_mask[step] = False
+
+            post_logits, learned_weights, post_mask = self.router.route_post(
+                post_router_features,
+                pre_mask=pre_mask,
+            )
+            oracle_mask = self._oracle_availability(
+                copy_hit=erm_enabled and has_copy_target,
+                episodic_hit=eem_enabled and has_episodic_target,
+                graph_hit=graph_enabled and (bool(graph_copy_target_mask[step].item()) or graph_target_node_id is not None),
+                post_mask=post_mask,
+                phase=phase_name,
+            )
+            oracle_availability[step] = oracle_mask
+            (
+                oracle_weights,
+                effective_weights,
+                step_warmup_beta,
+                step_warmup_active,
+                dominant_lane_dropped,
+                step_collapse_detected,
+                router_entropy,
+                dominant_lane_mass,
+                warmup_steps_remaining,
+            ) = self.router.apply_warmup(
+                post_logits=post_logits,
+                learned_weights=learned_weights,
+                post_mask=post_mask,
+                oracle_availability=oracle_mask,
+                phase=phase_name,
+                global_step=global_step,
+                training=self.training,
+            )
+            router_pre_logits.append(pre_logits)
+            router_post_logits.append(post_logits)
+            router_post_masks.append(post_mask.clone())
+            oracle_router_weight_list.append(oracle_weights.clone())
+            router_pre_mask[step] = pre_mask
+            invoked_lanes[step] = pre_mask
+            router_post_mask[step] = post_mask
+            router_weights[step] = learned_weights
+            effective_router_weights[step] = effective_weights
+            oracle_router_weights[step] = oracle_weights
+            warmup_beta[step] = step_warmup_beta
+            collapse_detected[step] = step_collapse_detected
+            warmup_active_steps += int(step_warmup_active)
+            dominant_lane_drop_steps += int(dominant_lane_dropped)
+            router_collapse_steps += int(step_collapse_detected)
+
+            blended_probabilities = (
+                effective_weights[0] * lm_probabilities
+                + effective_weights[1]
+                * (
+                    semantic_probabilities
+                    if semantic_probabilities is not None
+                    else lm_probabilities
+                )
+                + effective_weights[2] * exact_recent_result.distribution
+                + effective_weights[3] * exact_episodic_result.distribution
+                + effective_weights[4] * graph_result.distribution
+            )
+            logits[step] = torch.log(blended_probabilities.clamp_min(1e-8))
+
+            lm_logits[step] = step_lm_logits
+            base_hidden_states[step] = base_hidden
+            hidden_states[step] = hidden
+            semantic_contexts[step] = semantic_context
+            graph_contexts[step] = graph_context
 
             self.semantic_memory.write_hot(step_state)
-            total_maintenance += self.semantic_memory.consolidate(
-                self.config.semantic_memory.maintenance_budget,
-                step_state.step_index,
-            )
+            if maintenance_budget > 0.0:
+                with torch.no_grad():
+                    step_maintenance = self.semantic_memory.consolidate(
+                        maintenance_budget,
+                        step_state.step_index,
+                    )
+            else:
+                step_maintenance = 0
+            total_maintenance += step_maintenance
             total_hot_reads += hot_reads
             total_cold_reads += cold_reads
+            energy_proxy[step] = base_energy_proxy
             previous_lane_stats = lane_entropy.detach()
 
+        route_distribution = effective_router_weights.mean(dim=0)
+        route_entropy = self._distribution_entropy(route_distribution)
+        dominant_lane_mass = float(route_distribution.max().item())
         diagnostics = {
             "mean_update_rate": float(hssm_output.update_mask.float().mean().item()),
             "mean_entropy": float(entropy_tensor.mean().item()),
             "embedding_norm": float(embeddings.norm(dim=-1).mean().item()),
-            "route_entropy": float(self._distribution_entropy(router_weights.mean(dim=0))),
+            "route_entropy": float(route_entropy),
+            "learned_route_entropy": float(self._distribution_entropy(router_weights.mean(dim=0))),
+            "dominant_lane_mass": dominant_lane_mass,
             "energy_proxy": float(energy_proxy.mean().item()),
         }
-        always_on_energy = (
-            self.config.model.lane_cost_lm
-            + self.config.model.lane_cost_semantic_hot
-            + self.config.model.lane_cost_erm
+        always_on_energy = float((phase_policy["always_on_pre_mask"].float().to(device) * torch.tensor(
+            [
+                self.config.model.lane_cost_lm,
+                self.config.model.lane_cost_semantic_hot,
+                self.config.model.lane_cost_erm,
+                self.config.model.lane_cost_semantic_cold,
+                self.config.model.lane_cost_eem,
+                self.config.model.lane_cost_graph,
+            ],
+            device=device,
+        )).sum().item())
+        full_enabled_energy = (
+            always_on_energy
+            + self.config.model.lane_cost_semantic_cold
+            + self.config.model.lane_cost_eem
+            + self.config.model.lane_cost_graph
         )
+        hot_occupancy = sum(
+            len(self.semantic_memory.hot_slots[level]) / max(self.config.semantic_memory.hot_slots, 1)
+            for level in range(self.config.hssm.num_levels)
+        ) / max(self.config.hssm.num_levels, 1)
         memory_stats = {
             "hot_reads": float(total_hot_reads),
             "cold_reads": float(total_cold_reads),
+            "hot_occupancy": float(hot_occupancy),
             "maintenance_invocations": float(total_maintenance),
             "erm_reads": float(total_erm_reads),
             "erm_writes": float(total_erm_writes),
@@ -534,15 +645,32 @@ class PhaseACodeModel(nn.Module):
             "graph_test_hits": float(total_graph_test_hits),
             "graph_diagnostic_hits": float(total_graph_diagnostic_hits),
             "graph_fusion_steps": float(graph_fusion_steps),
+            "graph_task_eligible_steps": float(graph_task_eligible_steps),
             "cold_semantic_invocations": float(cold_semantic_invocations),
             "eem_invocations": float(eem_invocations),
             "graph_invocations": float(graph_invocations),
             "symbol_link_hits": float(symbol_link_hits),
             "avg_energy_proxy": float(energy_proxy.mean().item()),
             "always_on_energy": float(always_on_energy),
+            "full_enabled_energy": float(full_enabled_energy),
+            "hard_gated_energy_savings": float(full_enabled_energy - energy_proxy.mean().item()),
+            "router_entropy": float(route_entropy),
+            "dominant_lane_mass": float(dominant_lane_mass),
+            "warmup_steps_remaining": float(warmup_steps_remaining),
+            "warmup_active_steps": float(warmup_active_steps),
+            "dominant_lane_drop_steps": float(dominant_lane_drop_steps),
+            "router_collapse_steps": float(router_collapse_steps),
             "avg_skipped_expensive_reads": float(
                 (~router_pre_mask[:, 3:]).float().sum(dim=-1).mean().item()
             ),
+        }
+        phase_exit_probe_metrics = {
+            "recent_copy_hit_rate": float(copy_target_hits / max(seq_len - 1, 1)),
+            "episodic_hit_rate": float(episodic_target_hits / max(seq_len - 1, 1)),
+            "graph_copy_hit_rate": float(graph_copy_hits / max(seq_len - 1, 1)),
+            "symbol_link_hit_rate": float(symbol_link_hits / max(seq_len - 1, 1)),
+            "route_entropy": float(route_entropy),
+            "energy_proxy": float(energy_proxy.mean().item()),
         }
 
         return PhaseAOutput(
@@ -562,11 +690,18 @@ class PhaseACodeModel(nn.Module):
             base_hidden_states=base_hidden_states,
             graph_contexts=graph_contexts,
             router_weights=router_weights,
+            effective_router_weights=effective_router_weights,
+            oracle_router_weights=oracle_router_weights,
+            oracle_availability=oracle_availability,
             router_pre_mask=router_pre_mask,
             router_post_mask=router_post_mask,
             lane_entropies=lane_entropies,
             invoked_lanes=invoked_lanes,
             energy_proxy=energy_proxy,
+            warmup_beta=warmup_beta,
+            collapse_detected=collapse_detected,
+            phase_name=phase_name.value,
+            task_label=task_name.value,
             hidden_states=hidden_states,
             semantic_contexts=semantic_contexts,
             diagnostics=diagnostics,
@@ -588,6 +723,12 @@ class PhaseACodeModel(nn.Module):
                 "route_teacher_expensive": route_teacher_expensive,
                 "router_pre_logits": router_pre_logits,
                 "router_post_logits": router_post_logits,
+                "router_post_masks": router_post_masks,
+                "oracle_router_weights": oracle_router_weight_list,
+                "task_supervision_mask": None,
+                "infill_span": None,
+                "maintenance_decision": None,
+                "phase_exit_probe_metrics": phase_exit_probe_metrics,
             },
         )
 
@@ -669,6 +810,106 @@ class PhaseACodeModel(nn.Module):
         normalized = distribution / distribution.sum().clamp_min(1e-8)
         return float((-normalized * torch.log(normalized.clamp_min(1e-8))).sum().item())
 
+    def _resolve_phase(self, phase: TrainingPhase | str | None) -> TrainingPhase:
+        if phase is None:
+            return TrainingPhase(self.config.model.training_phase)
+        if isinstance(phase, TrainingPhase):
+            return phase
+        return TrainingPhase(phase)
+
+    def _resolve_task_label(
+        self,
+        batch: PhaseABatch,
+        task_label: TaskLabel | str | None,
+    ) -> TaskLabel:
+        if task_label is not None:
+            if isinstance(task_label, TaskLabel):
+                return task_label
+            return TaskLabel(task_label)
+        file_name = Path(batch.document.file_path).name.lower()
+        if "recent_copy" in file_name:
+            return TaskLabel.RECENT_COPY
+        if "episodic" in file_name:
+            return TaskLabel.EPISODIC_RECALL
+        if self.repo_graph_root is not None and self.repo_graph_memory.index is not None:
+            normalized = self._normalize_graph_path(batch.document.file_path)
+            if normalized in self.repo_graph_memory.index.node_ids_by_file:
+                return TaskLabel.REPO_GRAPH
+        return TaskLabel.AR
+
+    def _phase_policy(self, phase: TrainingPhase) -> dict[str, torch.Tensor | bool]:
+        device = self.level_gate_vectors.device
+        if phase == TrainingPhase.PHASE_A:
+            return {
+                "always_on_pre_mask": torch.tensor([1, 1, 0, 0, 0, 0], dtype=torch.bool, device=device),
+                "allowed_post_mask": torch.tensor([0, 1, 0, 0, 0], dtype=torch.bool, device=device),
+                "erm_enabled": False,
+                "eem_enabled": False,
+                "graph_enabled": False,
+                "cold_semantic_enabled": False,
+                "warmup_enabled": False,
+            }
+        if phase == TrainingPhase.PHASE_B:
+            return {
+                "always_on_pre_mask": torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool, device=device),
+                "allowed_post_mask": torch.tensor([1, 1, 1, 0, 0], dtype=torch.bool, device=device),
+                "erm_enabled": True,
+                "eem_enabled": False,
+                "graph_enabled": False,
+                "cold_semantic_enabled": True,
+                "warmup_enabled": True,
+            }
+        if phase == TrainingPhase.PHASE_C:
+            return {
+                "always_on_pre_mask": torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool, device=device),
+                "allowed_post_mask": torch.tensor([1, 1, 1, 1, 0], dtype=torch.bool, device=device),
+                "erm_enabled": True,
+                "eem_enabled": True,
+                "graph_enabled": False,
+                "cold_semantic_enabled": True,
+                "warmup_enabled": True,
+            }
+        if phase == TrainingPhase.PHASE_D:
+            return {
+                "always_on_pre_mask": torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool, device=device),
+                "allowed_post_mask": torch.tensor([1, 1, 1, 1, 1], dtype=torch.bool, device=device),
+                "erm_enabled": True,
+                "eem_enabled": True,
+                "graph_enabled": True,
+                "cold_semantic_enabled": True,
+                "warmup_enabled": True,
+            }
+        return {
+            "always_on_pre_mask": torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool, device=device),
+            "allowed_post_mask": torch.tensor([1, 1, 1, 1, 1], dtype=torch.bool, device=device),
+            "erm_enabled": True,
+            "eem_enabled": True,
+            "graph_enabled": True,
+            "cold_semantic_enabled": True,
+            "warmup_enabled": False,
+        }
+
+    def _oracle_availability(
+        self,
+        copy_hit: bool,
+        episodic_hit: bool,
+        graph_hit: bool,
+        post_mask: torch.Tensor,
+        phase: TrainingPhase,
+    ) -> torch.Tensor:
+        device = post_mask.device
+        availability = torch.tensor(
+            [1, 1, int(copy_hit), int(episodic_hit), int(graph_hit)],
+            dtype=torch.bool,
+            device=device,
+        )
+        if phase == TrainingPhase.PHASE_A:
+            availability = torch.tensor([0, 1, 0, 0, 0], dtype=torch.bool, device=device)
+        availability = availability & post_mask
+        if not bool(availability.any().item()):
+            availability = post_mask.clone()
+        return availability
+
     def _route_teacher(
         self,
         batch: PhaseABatch,
@@ -676,13 +917,16 @@ class PhaseACodeModel(nn.Module):
         copy_hit: bool,
         episodic_hit: bool,
         graph_hit: bool,
+        phase: TrainingPhase,
     ) -> tuple[int, tuple[int, int, int]]:
         token = batch.document.tokens[step]
+        if phase == TrainingPhase.PHASE_A:
+            return 1, (0, 0, 0)
         if copy_hit:
             return 2, (0, 0, 0)
         if episodic_hit:
             return 3, (0, 1, 0)
-        if graph_hit:
+        if graph_hit and phase in {TrainingPhase.PHASE_D, TrainingPhase.PHASE_E}:
             return 4, (0, 0, 1)
         if token.token_class in {
             TokenClass.KEYWORD,
@@ -695,6 +939,24 @@ class PhaseACodeModel(nn.Module):
         }:
             return 1, (1, 0, 0)
         return 0, (0, 0, 0)
+
+    def _graph_task_is_relevant(self, batch: PhaseABatch, step: int) -> bool:
+        if self.repo_graph_memory.index is None:
+            return False
+        token = batch.document.tokens[step]
+        if token.token_class not in {TokenClass.IDENTIFIER, TokenClass.STRING, TokenClass.NUMBER}:
+            return False
+
+        context = self._graph_query_context(batch, step)
+        if context.current_symbol_id is not None or context.current_symbol_name is not None:
+            return True
+
+        import_closure = self.repo_graph_memory.index.import_closure_by_file.get(context.file_path, ())
+        test_files = self.repo_graph_memory.index.test_files_by_source.get(context.file_path, ())
+        diagnostic_files = self.repo_graph_memory.index.diagnostic_files_by_source.get(context.file_path, ())
+        if import_closure or test_files or diagnostic_files:
+            return True
+        return False
 
     def _resolve_graph_target_node(
         self,
@@ -712,9 +974,28 @@ class PhaseACodeModel(nn.Module):
                 return candidate_id
         return None
 
-    def _empty_eem_result(self, device: torch.device):
-        from htm_code_native.data.types import ExactEpisodicReadResult
+    def _empty_erm_result(self, device: torch.device) -> ExactRecentReadResult:
+        return ExactRecentReadResult(
+            distribution=torch.zeros(self.config.model.vocabulary_size, device=device),
+            log_distribution=torch.full(
+                (self.config.model.vocabulary_size,),
+                fill_value=math.log(1e-8),
+                device=device,
+            ),
+            attention=torch.zeros(self.config.model.recent_window, device=device),
+            slot_token_ids=torch.full(
+                (self.config.model.recent_window,),
+                fill_value=-1,
+                dtype=torch.long,
+                device=device,
+            ),
+            filled_size=0,
+            read_count=0,
+            write_count=0,
+            overwrite_count=0,
+        )
 
+    def _empty_eem_result(self, device: torch.device) -> ExactEpisodicReadResult:
         return ExactEpisodicReadResult(
             distribution=torch.zeros(self.config.model.vocabulary_size, device=device),
             log_distribution=torch.full(
@@ -744,6 +1025,38 @@ class PhaseACodeModel(nn.Module):
             chunks_finalized=self.exact_episodic_memory.total_chunks_finalized,
             chunk_overhead=0.0,
             stored_chunks=len(self.exact_episodic_memory.chunks),
+        )
+
+    def _empty_graph_result(self, device: torch.device) -> RepoGraphReadResult:
+        return RepoGraphReadResult(
+            graph_context=torch.zeros(self.config.model.graph_value_dim, device=device),
+            distribution=torch.zeros(self.config.model.vocabulary_size, device=device),
+            log_distribution=torch.full(
+                (self.config.model.vocabulary_size,),
+                fill_value=math.log(1e-8),
+                device=device,
+            ),
+            attention=torch.zeros(self.config.model.graph_top_k, device=device),
+            copy_token_ids=torch.full(
+                (self.config.model.graph_top_k,),
+                fill_value=-1,
+                dtype=torch.long,
+                device=device,
+            ),
+            candidate_scores=torch.zeros(0, device=device),
+            candidate_node_ids=(),
+            candidate_kinds=(),
+            candidate_names=(),
+            retrieved_count=0,
+            read_count=0,
+            candidate_count=0,
+            copy_supported_count=0,
+            samefile_hits=0,
+            import_hits=0,
+            symbol_hits=0,
+            test_hits=0,
+            diagnostic_hits=0,
+            target_node_id=None,
         )
 
     def _chunk_type_for_step(self, batch: PhaseABatch, step: int, current_chunk_start: int) -> str | None:

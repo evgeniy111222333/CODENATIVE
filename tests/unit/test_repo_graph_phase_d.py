@@ -21,7 +21,7 @@ def test_repo_graph_indexer_builds_multilanguage_graph() -> None:
     config = HTMCodeNativeConfig.from_yaml(Path("configs/phase_a.yaml"))
     indexer = RepositoryGraphIndexer(
         key_dim=config.model.graph_key_dim,
-        value_dim=config.model.model_dim,
+        value_dim=config.model.graph_value_dim,
         max_files=config.model.repo_max_files,
     )
     index = indexer.build(WORKSPACE_ROOT, report_paths=REPORT_PATHS)
@@ -47,7 +47,7 @@ def test_repo_graph_query_returns_bias_hits_and_copy_support() -> None:
     config = HTMCodeNativeConfig.from_yaml(Path("configs/phase_a.yaml"))
     indexer = RepositoryGraphIndexer(
         key_dim=config.model.graph_key_dim,
-        value_dim=config.model.model_dim,
+        value_dim=config.model.graph_value_dim,
         max_files=config.model.repo_max_files,
     )
     index = indexer.build(WORKSPACE_ROOT, report_paths=REPORT_PATHS)
@@ -95,3 +95,6 @@ def test_repo_graph_query_returns_bias_hits_and_copy_support() -> None:
     assert "function" in result.candidate_kinds or "symbol" in result.candidate_kinds
     assert target_identifier in result.copy_token_ids.tolist()
     assert result.distribution[target_identifier].item() > 0.0
+    assert result.candidate_scores.numel() == result.retrieved_count
+    assert result.candidate_scores.requires_grad is True
+    assert result.target_node_id is not None

@@ -12,8 +12,10 @@ if str(SRC) not in sys.path:
 
 import torch
 
-from htm_code_native.cli import build_batch, build_repo_graph_index, load_config
+from htm_code_native.cli import build_repo_graph_index, load_config
+from htm_code_native.data.types import TrainingPhase
 from htm_code_native.model.phase_a import PhaseACodeModel
+from htm_code_native.training import build_task_batch, build_task_example
 
 
 def _mean_target_probability(output, batch, token_class: str) -> float:
@@ -84,7 +86,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = load_config(None)
-    _, _, batch = build_batch(args.file_path, config)
+    phase = TrainingPhase(config.model.training_phase)
+    example = build_task_example(
+        args.file_path,
+        repo_root=args.repo_root,
+        report_paths=args.report_path,
+    )
+    task_label = example.task_label
+    task_batch = build_task_batch(example, config)
+    batch = task_batch.batch
     graph_index = build_repo_graph_index(
         args.file_path,
         config,
@@ -99,7 +109,7 @@ def main() -> int:
     iterations = 5
     for _ in range(warmup):
         with torch.no_grad():
-            model(batch)
+            model(batch, phase=phase, task_label=task_label)
 
     start = time.perf_counter()
     hot_reads = 0.0
@@ -132,7 +142,7 @@ def main() -> int:
     cold_semantic_invocation_rate = 0.0
     for _ in range(iterations):
         with torch.no_grad():
-            output = model(batch)
+            output = model(batch, phase=phase, task_label=task_label)
         hot_reads += output.memory_stats["hot_reads"]
         cold_reads += output.memory_stats["cold_reads"]
         maintenance += output.memory_stats["maintenance_invocations"]
@@ -205,13 +215,15 @@ def main() -> int:
             "graph_diagnostic_recall": graph_diagnostic_recall / iterations,
             "avg_route_entropy": route_entropy / iterations,
             "avg_energy_proxy": energy_proxy / iterations,
+            "avg_warmup_beta": float(output.warmup_beta.mean().item()),
+            "collapse_detected": bool(output.collapse_detected.any().item()),
             "avg_skipped_expensive_reads": skipped_expensive / iterations,
             "graph_invocation_rate": graph_invocation_rate / iterations,
             "eem_invocation_rate": eem_invocation_rate / iterations,
             "cold_semantic_invocation_rate": cold_semantic_invocation_rate / iterations,
-            "always_on_vs_hard_gated_delta": (
-                output.memory_stats["always_on_energy"] - output.memory_stats["avg_energy_proxy"]
-            ),
+            "always_on_energy": output.memory_stats["always_on_energy"],
+            "full_enabled_energy": output.memory_stats["full_enabled_energy"],
+            "hard_gated_energy_savings": output.memory_stats["hard_gated_energy_savings"],
         }
     )
     return 0

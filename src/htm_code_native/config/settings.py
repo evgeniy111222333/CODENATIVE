@@ -81,6 +81,20 @@ class PhaseAModelConfig:
     route_weight: float = 0.1
     energy_weight: float = 0.01
     route_consistency_weight: float = 0.02
+    training_phase: str = "phase_d"
+    router_warmup_steps: int = 256
+    router_oracle_sharpness: float = 4.0
+    router_oracle_bias_lm: float = 0.0
+    router_oracle_bias_semantic: float = 0.0
+    router_oracle_bias_erm: float = 0.0
+    router_oracle_bias_eem: float = 0.0
+    router_oracle_bias_graph: float = 0.0
+    router_lane_dropout_prob: float = 0.05
+    router_entropy_floor_min: float = 1.10
+    router_entropy_floor_weight: float = 0.02
+    router_collapse_mass_threshold: float = 0.95
+    router_collapse_window: int = 32
+    router_recovery_steps: int = 64
     lane_cost_lm: float = 1.0
     lane_cost_semantic_hot: float = 1.0
     lane_cost_erm: float = 1.0
@@ -88,6 +102,17 @@ class PhaseAModelConfig:
     lane_cost_eem: float = 2.5
     lane_cost_graph: float = 2.5
     maintenance_cost: float = 0.5
+    optimizer_base_lr: float = 1e-3
+    auxiliary_cap_ratio: float = 0.5
+    maintenance_cadence: int = 16
+    maintenance_ema_decay: float = 0.9
+    maintenance_loss_spike_delta: float = 0.05
+    probe_min_tokens_per_sec: float = 5.0
+    probe_max_energy_proxy: float = 20.0
+    probe_min_recent_copy_hit_rate: float = 0.01
+    probe_min_episodic_hit_rate: float = 0.01
+    probe_min_symbol_link_hit_rate: float = 0.01
+    probe_min_route_entropy: float = 0.5
 
 
 @dataclass(slots=True)
@@ -272,6 +297,62 @@ class HTMCodeNativeConfig:
     @property
     def route_consistency_weight(self) -> float:
         return self.model.route_consistency_weight
+
+    @property
+    def training_phase(self) -> str:
+        return self.model.training_phase
+
+    @property
+    def router_warmup_steps(self) -> int:
+        return self.model.router_warmup_steps
+
+    @property
+    def router_oracle_sharpness(self) -> float:
+        return self.model.router_oracle_sharpness
+
+    @property
+    def router_oracle_bias_lm(self) -> float:
+        return self.model.router_oracle_bias_lm
+
+    @property
+    def router_oracle_bias_semantic(self) -> float:
+        return self.model.router_oracle_bias_semantic
+
+    @property
+    def router_oracle_bias_erm(self) -> float:
+        return self.model.router_oracle_bias_erm
+
+    @property
+    def router_oracle_bias_eem(self) -> float:
+        return self.model.router_oracle_bias_eem
+
+    @property
+    def router_oracle_bias_graph(self) -> float:
+        return self.model.router_oracle_bias_graph
+
+    @property
+    def router_lane_dropout_prob(self) -> float:
+        return self.model.router_lane_dropout_prob
+
+    @property
+    def router_entropy_floor_min(self) -> float:
+        return self.model.router_entropy_floor_min
+
+    @property
+    def router_entropy_floor_weight(self) -> float:
+        return self.model.router_entropy_floor_weight
+
+    @property
+    def router_collapse_mass_threshold(self) -> float:
+        return self.model.router_collapse_mass_threshold
+
+    @property
+    def router_collapse_window(self) -> int:
+        return self.model.router_collapse_window
+
+    @property
+    def router_recovery_steps(self) -> int:
+        return self.model.router_recovery_steps
 
     @property
     def lane_cost_lm(self) -> float:
