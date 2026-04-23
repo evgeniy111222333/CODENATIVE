@@ -1,0 +1,5 @@
+{
+  "serviceName": "repo_graph_service",
+  "featureToggle": "enabled",
+  "port": 4242
+}

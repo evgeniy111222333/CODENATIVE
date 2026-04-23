@@ -1,0 +1,11 @@
+[
+  {
+    "filePath": "frontend/widget.ts",
+    "messages": [
+      {
+        "ruleId": "no-console",
+        "message": "Unexpected console usage"
+      }
+    ]
+  }
+]

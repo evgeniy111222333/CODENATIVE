@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="repo_graph_suite" tests="1" failures="1">
+  <testcase classname="app.core" name="test_build_payload_uses_graph_shared_name" file="app/core.py">
+    <failure message="AssertionError: expected shared_graph_token in app/core.py" />
+  </testcase>
+</testsuite>
