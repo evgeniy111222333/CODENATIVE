@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -11,7 +12,7 @@ if str(SRC) not in sys.path:
 
 import torch
 
-from htm_code_native.cli import build_batch, load_config
+from htm_code_native.cli import build_batch, build_repo_graph_index, load_config
 from htm_code_native.model.phase_a import PhaseACodeModel
 
 
@@ -47,11 +48,51 @@ def _mean_episodic_target_probability(output, batch, token_class: str) -> float:
     return sum(values) / len(values)
 
 
+def _mean_graph_target_probability(
+    output,
+    batch,
+    token_class: str | None = None,
+    required_kinds: set[str] | None = None,
+) -> float:
+    values: list[float] = []
+    candidate_kinds = output.auxiliary.get("graph_candidate_kinds", [])
+    seq_len = len(batch.document.tokens)
+    for step in range(seq_len - 1):
+        if output.graph_logits is None or not bool(output.graph_copy_target_mask[step].item()):
+            continue
+        target_token = batch.document.tokens[step + 1]
+        if token_class is not None and target_token.token_class.value != token_class:
+            continue
+        step_kinds = set(candidate_kinds[step]) if step < len(candidate_kinds) else set()
+        if required_kinds is not None and not step_kinds.intersection(required_kinds):
+            continue
+        target_id = int(batch.targets[step].item())
+        values.append(float(output.graph_logits[step, target_id].exp().item()))
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("file_path", nargs="?", default="tests/fixtures/repo_graph_workspace/app/core.py")
+    parser.add_argument("--repo-root")
+    parser.add_argument("--report-path", action="append", default=[])
+    return parser.parse_args(argv)
+
+
 def main() -> int:
+    args = parse_args()
     config = load_config(None)
-    file_path = sys.argv[1] if len(sys.argv) > 1 else "tests/fixtures/episodic_copy_module.py"
-    _, _, batch = build_batch(file_path, config)
+    _, _, batch = build_batch(args.file_path, config)
+    graph_index = build_repo_graph_index(
+        args.file_path,
+        config,
+        repo_root=args.repo_root,
+        report_paths=args.report_path,
+    )
     model = PhaseACodeModel(config)
+    model.set_repo_graph_index(graph_index)
     model.eval()
 
     warmup = 2
@@ -78,6 +119,11 @@ def main() -> int:
     long_identifier_recall = 0.0
     long_string_recall = 0.0
     long_number_recall = 0.0
+    graph_reads = 0.0
+    graph_candidates = 0.0
+    graph_symbol_recall = 0.0
+    graph_test_recall = 0.0
+    graph_diagnostic_recall = 0.0
     for _ in range(iterations):
         with torch.no_grad():
             output = model(batch)
@@ -98,12 +144,30 @@ def main() -> int:
         long_identifier_recall += _mean_episodic_target_probability(output, batch, "identifier")
         long_string_recall += _mean_episodic_target_probability(output, batch, "string")
         long_number_recall += _mean_episodic_target_probability(output, batch, "number")
+        graph_reads += output.memory_stats["graph_reads"]
+        graph_candidates += output.memory_stats["graph_candidates"]
+        graph_symbol_recall += _mean_graph_target_probability(
+            output,
+            batch,
+            token_class="identifier",
+            required_kinds={"symbol", "function", "class"},
+        )
+        graph_test_recall += _mean_graph_target_probability(
+            output,
+            batch,
+            required_kinds={"test"},
+        )
+        graph_diagnostic_recall += _mean_graph_target_probability(
+            output,
+            batch,
+            required_kinds={"diagnostic"},
+        )
     elapsed = time.perf_counter() - start
     tokens = len(batch.document.tokens) * iterations
 
     print(
         {
-            "file": file_path,
+            "file": args.file_path,
             "tokens_per_sec": tokens / max(elapsed, 1e-6),
             "avg_hot_reads": hot_reads / iterations,
             "avg_cold_reads": cold_reads / iterations,
@@ -122,6 +186,11 @@ def main() -> int:
             "long_range_identifier_recall": long_identifier_recall / iterations,
             "long_range_string_recall": long_string_recall / iterations,
             "long_range_number_recall": long_number_recall / iterations,
+            "avg_graph_reads": graph_reads / iterations,
+            "avg_graph_candidates": graph_candidates / iterations,
+            "graph_symbol_recall": graph_symbol_recall / iterations,
+            "graph_test_recall": graph_test_recall / iterations,
+            "graph_diagnostic_recall": graph_diagnostic_recall / iterations,
         }
     )
     return 0

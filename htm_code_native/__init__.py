@@ -10,7 +10,9 @@ if src_package_path.exists():
 
 from .config.settings import HTMCodeNativeConfig  # noqa: E402
 from .data.vocabulary import VocabularyRegistry  # noqa: E402
+from .memory.exact_episodic import ExactEpisodicMemory  # noqa: E402
 from .memory.exact_recent import ExactRecentMemory  # noqa: E402
+from .memory.repo_graph import RepositoryGraphIndexer, RepositoryGraphMemory  # noqa: E402
 from .model.phase_a import PhaseACodeModel  # noqa: E402
 from .tokenizer.python_tokenizer import PythonTokenizer  # noqa: E402
 from .tokenizer.structure import PythonStructureExtractor  # noqa: E402
@@ -18,7 +20,10 @@ from .tokenizer.structure import PythonStructureExtractor  # noqa: E402
 __all__ = [
     "HTMCodeNativeConfig",
     "VocabularyRegistry",
+    "ExactEpisodicMemory",
     "ExactRecentMemory",
+    "RepositoryGraphIndexer",
+    "RepositoryGraphMemory",
     "PhaseACodeModel",
     "PythonTokenizer",
     "PythonStructureExtractor",

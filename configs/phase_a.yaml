@@ -20,6 +20,16 @@ model:
   max_chunk_tokens: 128
   eem_top_k: 2
   max_episodic_chunks: 64
+  graph_key_dim: 128
+  graph_top_k: 4
+  graph_blend: 0.15
+  graph_copy_weight: 0.5
+  graph_samefile_bias: 2.0
+  graph_import_bias: 1.5
+  graph_symbol_bias: 1.25
+  graph_test_bias: 1.0
+  graph_diagnostic_bias: 1.0
+  repo_max_files: 256
 hssm:
   max_level: 5
   hidden_size: 128

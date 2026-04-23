@@ -53,6 +53,16 @@ class PhaseAModelConfig:
     max_chunk_tokens: int = 128
     eem_top_k: int = 2
     max_episodic_chunks: int = 64
+    graph_key_dim: int = 128
+    graph_top_k: int = 4
+    graph_blend: float = 0.15
+    graph_copy_weight: float = 0.5
+    graph_samefile_bias: float = 2.0
+    graph_import_bias: float = 1.5
+    graph_symbol_bias: float = 1.25
+    graph_test_bias: float = 1.0
+    graph_diagnostic_bias: float = 1.0
+    repo_max_files: int = 256
 
 
 @dataclass(slots=True)
@@ -133,3 +143,43 @@ class HTMCodeNativeConfig:
     @property
     def max_episodic_chunks(self) -> int:
         return self.model.max_episodic_chunks
+
+    @property
+    def graph_key_dim(self) -> int:
+        return self.model.graph_key_dim
+
+    @property
+    def graph_top_k(self) -> int:
+        return self.model.graph_top_k
+
+    @property
+    def graph_blend(self) -> float:
+        return self.model.graph_blend
+
+    @property
+    def graph_copy_weight(self) -> float:
+        return self.model.graph_copy_weight
+
+    @property
+    def graph_samefile_bias(self) -> float:
+        return self.model.graph_samefile_bias
+
+    @property
+    def graph_import_bias(self) -> float:
+        return self.model.graph_import_bias
+
+    @property
+    def graph_symbol_bias(self) -> float:
+        return self.model.graph_symbol_bias
+
+    @property
+    def graph_test_bias(self) -> int | float:
+        return self.model.graph_test_bias
+
+    @property
+    def graph_diagnostic_bias(self) -> int | float:
+        return self.model.graph_diagnostic_bias
+
+    @property
+    def repo_max_files(self) -> int:
+        return self.model.repo_max_files

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 from torch import nn
 
 from htm_code_native.config.settings import HTMCodeNativeConfig
-from htm_code_native.data.types import HSSMState, PhaseABatch, PhaseAOutput
+from htm_code_native.data.types import HSSMState, PhaseABatch, PhaseAOutput, RepoGraphQueryContext, RepositoryGraphIndex
 from htm_code_native.encoders.code import CodeAwareEmbedding
 from htm_code_native.memory.exact_episodic import ExactEpisodicMemory
 from htm_code_native.hssm.core import HSSMCore
 from htm_code_native.memory.exact_recent import ExactRecentMemory
+from htm_code_native.memory.repo_graph import RepositoryGraphMemory
 from htm_code_native.memory.semantic.store import SemanticMemory
 
 
@@ -19,13 +21,20 @@ class PhaseACodeModel(nn.Module):
         super().__init__()
         if config.model.model_dim != config.hssm.hidden_size:
             raise ValueError("Phase A expects model.model_dim == hssm.hidden_size.")
-        if config.model.semantic_blend + config.model.erm_blend + config.model.eem_blend > 1.0:
-            raise ValueError("semantic_blend + erm_blend + eem_blend must not exceed 1.0.")
+        if (
+            config.model.semantic_blend
+            + config.model.erm_blend
+            + config.model.eem_blend
+            + config.model.graph_blend
+            > 1.0
+        ):
+            raise ValueError("semantic_blend + erm_blend + eem_blend + graph_blend must not exceed 1.0.")
 
         self.config = config
         hidden_size = config.model.model_dim
         num_levels = config.hssm.num_levels
         master_dim = hidden_size * num_levels
+        self.repo_graph_root: Path | None = None
 
         self.encoder = CodeAwareEmbedding(config)
         self.hssm = HSSMCore(config.hssm)
@@ -45,6 +54,18 @@ class PhaseACodeModel(nn.Module):
             top_k=config.model.eem_top_k,
             max_chunk_tokens=config.model.max_chunk_tokens,
             max_chunks=config.model.max_episodic_chunks,
+        )
+        self.repo_graph_memory = RepositoryGraphMemory(
+            hidden_size=hidden_size,
+            key_dim=config.model.graph_key_dim,
+            vocab_size=config.model.vocabulary_size,
+            top_k=config.model.graph_top_k,
+            graph_copy_weight=config.model.graph_copy_weight,
+            samefile_bias=config.model.graph_samefile_bias,
+            import_bias=config.model.graph_import_bias,
+            symbol_bias=config.model.graph_symbol_bias,
+            test_bias=config.model.graph_test_bias,
+            diagnostic_bias=config.model.graph_diagnostic_bias,
         )
 
         self.master_norm = nn.LayerNorm(master_dim)
@@ -67,11 +88,16 @@ class PhaseACodeModel(nn.Module):
             else None
         )
 
+    def set_repo_graph_index(self, index: RepositoryGraphIndex | None) -> None:
+        self.repo_graph_memory.set_index(index)
+        self.repo_graph_root = Path(index.root_path).resolve() if index is not None else None
+
     def forward(self, batch: PhaseABatch, reset_eem: bool = True) -> PhaseAOutput:
         embeddings, encoder_parts = self.encoder(batch)
         hssm_output = self.hssm(embeddings, batch.boundaries)
         self.semantic_memory.reset()
         self.exact_recent_memory.reset()
+        self.repo_graph_memory.reset()
         if reset_eem:
             self.exact_episodic_memory.reset()
 
@@ -109,6 +135,13 @@ class PhaseACodeModel(nn.Module):
             device=embeddings.device,
         )
         episodic_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=embeddings.device)
+        graph_logits = torch.full_like(logits, fill_value=math.log(1e-8))
+        graph_attention = torch.zeros(
+            seq_len,
+            self.config.model.graph_top_k,
+            device=embeddings.device,
+        )
+        graph_copy_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=embeddings.device)
         entropy_tensor = torch.zeros(seq_len, num_levels, device=embeddings.device)
         total_hot_reads = 0
         total_cold_reads = 0
@@ -121,7 +154,18 @@ class PhaseACodeModel(nn.Module):
         total_chunks_finalized = 0
         total_chunk_overhead = 0.0
         episodic_target_hits = 0
+        total_graph_reads = 0
+        total_graph_candidates = 0
+        total_graph_samefile_hits = 0
+        total_graph_import_hits = 0
+        total_graph_symbol_hits = 0
+        total_graph_test_hits = 0
+        total_graph_diagnostic_hits = 0
+        graph_copy_hits = 0
         current_chunk_start = 0
+        graph_candidate_ids: list[tuple[str, ...]] = []
+        graph_candidate_kinds: list[tuple[str, ...]] = []
+        graph_candidate_names: list[tuple[str, ...]] = []
 
         for step in range(seq_len):
             step_level_states = [
@@ -223,6 +267,39 @@ class PhaseACodeModel(nn.Module):
                 episodic_target_mask[step] = has_episodic_target
                 episodic_target_hits += int(has_episodic_target)
 
+            structure = batch.document.token_structures[step]
+            graph_context = RepoGraphQueryContext(
+                file_path=self._normalize_graph_path(structure.file_id),
+                current_symbol_id=structure.symbol_id,
+                current_symbol_name=structure.symbol_name,
+                scope_path=structure.scope_path,
+                token_value=batch.document.tokens[step].value,
+                token_class=batch.document.tokens[step].token_class.value,
+            )
+            graph_result = self.repo_graph_memory.query(
+                hidden,
+                graph_context,
+                batch.vocabulary_snapshot,
+            )
+            graph_logits[step] = graph_result.log_distribution
+            graph_attention[step] = graph_result.attention
+            graph_candidate_ids.append(graph_result.candidate_node_ids)
+            graph_candidate_kinds.append(graph_result.candidate_kinds)
+            graph_candidate_names.append(graph_result.candidate_names)
+            total_graph_reads += graph_result.read_count
+            total_graph_candidates += graph_result.candidate_count
+            total_graph_samefile_hits += graph_result.samefile_hits
+            total_graph_import_hits += graph_result.import_hits
+            total_graph_symbol_hits += graph_result.symbol_hits
+            total_graph_test_hits += graph_result.test_hits
+            total_graph_diagnostic_hits += graph_result.diagnostic_hits
+
+            if step < seq_len - 1 and graph_result.copy_token_ids.numel() > 0:
+                target_token_id = int(batch.targets[step].item())
+                has_graph_copy = bool((graph_result.copy_token_ids == target_token_id).any().item())
+                graph_copy_target_mask[step] = has_graph_copy
+                graph_copy_hits += int(has_graph_copy)
+
             semantic_weight = (
                 self.config.model.semantic_blend if semantic_probabilities is not None else 0.0
             )
@@ -232,10 +309,13 @@ class PhaseACodeModel(nn.Module):
             eem_weight = (
                 self.config.model.eem_blend if exact_episodic_result.retrieved_chunk_count > 0 else 0.0
             )
-            lm_weight = 1.0 - semantic_weight - erm_weight - eem_weight
+            graph_weight = (
+                self.config.model.graph_blend if graph_result.retrieved_count > 0 else 0.0
+            )
+            lm_weight = 1.0 - semantic_weight - erm_weight - eem_weight - graph_weight
             if lm_weight < 0.0:
                 lm_weight = 0.0
-            total_weight = lm_weight + semantic_weight + erm_weight + eem_weight
+            total_weight = lm_weight + semantic_weight + erm_weight + eem_weight + graph_weight
             if total_weight == 0.0:
                 total_weight = 1.0
                 lm_weight = 1.0
@@ -253,6 +333,10 @@ class PhaseACodeModel(nn.Module):
                 blended_probabilities = blended_probabilities + (
                     eem_weight / total_weight
                 ) * exact_episodic_result.distribution
+            if graph_result.retrieved_count > 0:
+                blended_probabilities = blended_probabilities + (
+                    graph_weight / total_weight
+                ) * graph_result.distribution
             blended = torch.log(blended_probabilities.clamp_min(1e-8))
 
             lm_logits[step] = step_lm_logits
@@ -281,6 +365,14 @@ class PhaseACodeModel(nn.Module):
             "stored_chunks": float(len(self.exact_episodic_memory.chunks)),
             "avg_chunk_overhead": float(total_chunk_overhead / max(seq_len, 1)),
             "episodic_target_hits": float(episodic_target_hits),
+            "graph_reads": float(total_graph_reads),
+            "graph_candidates": float(total_graph_candidates),
+            "graph_copy_hits": float(graph_copy_hits),
+            "graph_samefile_hits": float(total_graph_samefile_hits),
+            "graph_import_hits": float(total_graph_import_hits),
+            "graph_symbol_hits": float(total_graph_symbol_hits),
+            "graph_test_hits": float(total_graph_test_hits),
+            "graph_diagnostic_hits": float(total_graph_diagnostic_hits),
         }
 
         return PhaseAOutput(
@@ -294,6 +386,9 @@ class PhaseACodeModel(nn.Module):
             eem_attention=eem_attention,
             pointer_attention=pointer_attention,
             episodic_target_mask=episodic_target_mask,
+            graph_logits=graph_logits,
+            graph_attention=graph_attention,
+            graph_copy_target_mask=graph_copy_target_mask,
             hidden_states=hidden_states,
             semantic_contexts=semantic_contexts,
             diagnostics=diagnostics,
@@ -306,6 +401,9 @@ class PhaseACodeModel(nn.Module):
                 "lower_aggregates": hssm_output.lower_aggregates,
                 "entropy_tensor": entropy_tensor,
                 "vocabulary_snapshot": batch.vocabulary_snapshot,
+                "graph_candidate_ids": graph_candidate_ids,
+                "graph_candidate_kinds": graph_candidate_kinds,
+                "graph_candidate_names": graph_candidate_names,
             },
         )
 
@@ -322,3 +420,12 @@ class PhaseACodeModel(nn.Module):
         if chunk_length >= self.config.model.max_chunk_tokens:
             return "threshold"
         return None
+
+    def _normalize_graph_path(self, file_path: str) -> str:
+        path = Path(file_path)
+        if self.repo_graph_root is None:
+            return path.as_posix()
+        try:
+            return path.resolve().relative_to(self.repo_graph_root).as_posix()
+        except (ValueError, RuntimeError):
+            return path.as_posix()

@@ -22,6 +22,9 @@ class VocabularySnapshot:
     def token_for_id(self, token_id: int) -> str:
         return self.id_to_token.get(token_id, self.id_to_token[self.unk_id])
 
+    def lookup_token(self, value: str) -> int | None:
+        return self.token_to_id.get(value)
+
 
 class VocabularyRegistry:
     def __init__(self, capacity: int, special_tokens: tuple[str, ...] = SPECIAL_TOKENS) -> None:

@@ -225,6 +225,86 @@ class ExactEpisodicReadResult:
 
 
 @dataclass(slots=True)
+class RepositoryGraphNode:
+    node_id: str
+    kind: str
+    name: str
+    file_path: str | None
+    copy_terms: tuple[str, ...]
+    key: torch.Tensor
+    value: torch.Tensor
+    heuristic: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class RepositoryGraphEdge:
+    source_id: str
+    target_id: str
+    kind: str
+    heuristic: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class RepositoryGraphIndex:
+    root_path: str
+    nodes: list[RepositoryGraphNode]
+    edges: list[RepositoryGraphEdge]
+    nodes_by_id: dict[str, RepositoryGraphNode]
+    node_ids_by_file: dict[str, tuple[str, ...]]
+    import_closure_by_file: dict[str, tuple[str, ...]]
+    test_files_by_source: dict[str, tuple[str, ...]]
+    diagnostic_files_by_source: dict[str, tuple[str, ...]]
+
+    def to_summary(self) -> dict[str, Any]:
+        node_kind_counts: dict[str, int] = {}
+        edge_kind_counts: dict[str, int] = {}
+        for node in self.nodes:
+            node_kind_counts[node.kind] = node_kind_counts.get(node.kind, 0) + 1
+        for edge in self.edges:
+            edge_kind_counts[edge.kind] = edge_kind_counts.get(edge.kind, 0) + 1
+        return {
+            "root_path": self.root_path,
+            "node_count": len(self.nodes),
+            "edge_count": len(self.edges),
+            "node_kinds": node_kind_counts,
+            "edge_kinds": edge_kind_counts,
+        }
+
+
+@dataclass(slots=True)
+class RepoGraphQueryContext:
+    file_path: str
+    current_symbol_id: str | None
+    current_symbol_name: str | None
+    scope_path: tuple[str, ...]
+    token_value: str
+    token_class: str
+
+
+@dataclass(slots=True)
+class RepoGraphReadResult:
+    graph_context: torch.Tensor
+    distribution: torch.Tensor
+    log_distribution: torch.Tensor
+    attention: torch.Tensor
+    copy_token_ids: torch.Tensor
+    candidate_node_ids: tuple[str, ...]
+    candidate_kinds: tuple[str, ...]
+    candidate_names: tuple[str, ...]
+    retrieved_count: int
+    read_count: int
+    candidate_count: int
+    copy_supported_count: int
+    samefile_hits: int
+    import_hits: int
+    symbol_hits: int
+    test_hits: int
+    diagnostic_hits: int
+
+
+@dataclass(slots=True)
 class PhaseAOutput:
     logits: torch.Tensor
     lm_logits: torch.Tensor
@@ -236,6 +316,9 @@ class PhaseAOutput:
     eem_attention: torch.Tensor | None
     pointer_attention: torch.Tensor | None
     episodic_target_mask: torch.Tensor | None
+    graph_logits: torch.Tensor | None
+    graph_attention: torch.Tensor | None
+    graph_copy_target_mask: torch.Tensor | None
     hidden_states: torch.Tensor
     semantic_contexts: torch.Tensor
     diagnostics: dict[str, float]

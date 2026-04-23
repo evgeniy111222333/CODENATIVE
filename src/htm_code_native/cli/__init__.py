@@ -12,10 +12,12 @@ from htm_code_native.data.vocabulary import VocabularyRegistry
 from htm_code_native.losses.core import (
     autoregressive_loss,
     episodic_pointer_loss,
+    graph_copy_loss,
     hierarchical_consistency_loss,
     recent_copy_loss,
     sparse_retrieval_entropy_loss,
 )
+from htm_code_native.memory.repo_graph import RepositoryGraphIndexer
 from htm_code_native.model.phase_a import PhaseACodeModel
 from htm_code_native.tokenizer.boundary import BoundaryScheduler
 from htm_code_native.tokenizer.python_tokenizer import PythonTokenizer
@@ -29,6 +31,44 @@ def load_config(config_path: str | None) -> HTMCodeNativeConfig:
     if default_path.exists():
         return HTMCodeNativeConfig.from_yaml(default_path)
     return HTMCodeNativeConfig.default()
+
+
+def resolve_repo_root(file_path: str, repo_root: str | None = None) -> Path:
+    if repo_root is not None:
+        return Path(repo_root).resolve()
+    current = Path(file_path).resolve()
+    start = current if current.is_dir() else current.parent
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return start
+
+
+def default_report_paths(repo_root: Path) -> list[str]:
+    report_dir = repo_root / "reports"
+    if not report_dir.exists():
+        return []
+    return [
+        str(path)
+        for path in sorted(report_dir.rglob("*"))
+        if path.is_file() and path.suffix.lower() in {".xml", ".json", ".txt", ".log"}
+    ]
+
+
+def build_repo_graph_index(
+    file_path: str,
+    config: HTMCodeNativeConfig,
+    repo_root: str | None = None,
+    report_paths: list[str] | None = None,
+):
+    resolved_root = resolve_repo_root(file_path, repo_root)
+    effective_reports = report_paths if report_paths else default_report_paths(resolved_root)
+    indexer = RepositoryGraphIndexer(
+        key_dim=config.model.graph_key_dim,
+        value_dim=config.model.model_dim,
+        max_files=config.model.repo_max_files,
+    )
+    return indexer.build(resolved_root, report_paths=effective_reports)
 
 
 def build_batch(
@@ -79,6 +119,12 @@ def command_tokenize(args: argparse.Namespace) -> int:
 def command_inspect(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     document, boundaries, _ = build_batch(args.file_path, config)
+    graph_index = build_repo_graph_index(
+        args.file_path,
+        config,
+        repo_root=args.repo_root,
+        report_paths=args.report_path,
+    )
     payload = {
         "summary": document.to_summary(),
         "symbols": [
@@ -93,6 +139,7 @@ def command_inspect(args: argparse.Namespace) -> int:
         "boundary_counts": {
             str(level): int(sum(mask)) for level, mask in boundaries.level_events.items()
         },
+        "graph_summary": graph_index.to_summary(),
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
@@ -101,7 +148,14 @@ def command_inspect(args: argparse.Namespace) -> int:
 def command_run_forward(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     _, _, batch = build_batch(args.file_path, config)
+    graph_index = build_repo_graph_index(
+        args.file_path,
+        config,
+        repo_root=args.repo_root,
+        report_paths=args.report_path,
+    )
     model = PhaseACodeModel(config)
+    model.set_repo_graph_index(graph_index)
     model.eval()
     with torch.no_grad():
         output = model(batch)
@@ -114,6 +168,10 @@ def command_run_forward(args: argparse.Namespace) -> int:
             output.eem_logits[-1].exp(),
             k=min(5, output.eem_logits.shape[-1]),
         )
+        graph_values, graph_indices = torch.topk(
+            output.graph_logits[-1].exp(),
+            k=min(5, output.graph_logits.shape[-1]),
+        )
     payload = {
         "logits_shape": list(output.logits.shape),
         "registry_size": batch.registry_size,
@@ -125,6 +183,12 @@ def command_run_forward(args: argparse.Namespace) -> int:
         "last_step_top_copy_scores": [float(value) for value in copy_values.tolist()],
         "last_step_top_eem_ids": eem_indices.tolist(),
         "last_step_top_eem_scores": [float(value) for value in eem_values.tolist()],
+        "last_step_top_graph_ids": graph_indices.tolist(),
+        "last_step_top_graph_scores": [float(value) for value in graph_values.tolist()],
+        "last_graph_candidate_ids": list(output.auxiliary["graph_candidate_ids"][-1]),
+        "last_graph_candidate_kinds": list(output.auxiliary["graph_candidate_kinds"][-1]),
+        "last_graph_candidate_names": list(output.auxiliary["graph_candidate_names"][-1]),
+        "graph_summary": graph_index.to_summary(),
     }
     print(json.dumps(payload, indent=2))
     return 0
@@ -140,9 +204,22 @@ def command_smoke_train(args: argparse.Namespace) -> int:
     model = PhaseACodeModel(config)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    graph_cache: dict[tuple[str, tuple[str, ...]], object] = {}
 
     for step in range(args.steps):
-        _, _, batch = build_batch(input_files[step % len(input_files)], config, registry=registry)
+        file_path = input_files[step % len(input_files)]
+        _, _, batch = build_batch(file_path, config, registry=registry)
+        resolved_root = str(resolve_repo_root(file_path, args.repo_root))
+        report_paths = tuple(sorted(args.report_path or default_report_paths(Path(resolved_root))))
+        cache_key = (resolved_root, report_paths)
+        if cache_key not in graph_cache:
+            graph_cache[cache_key] = build_repo_graph_index(
+                file_path,
+                config,
+                repo_root=resolved_root,
+                report_paths=list(report_paths),
+            )
+        model.set_repo_graph_index(graph_cache[cache_key])
         optimizer.zero_grad()
         output = model(batch, reset_eem=(step == 0))
         ar_loss = autoregressive_loss(output.logits, batch.targets)
@@ -158,12 +235,18 @@ def command_smoke_train(args: argparse.Namespace) -> int:
             batch.targets,
             output.episodic_target_mask,
         )
+        graph_loss = graph_copy_loss(
+            output.graph_logits,
+            batch.targets,
+            output.graph_copy_target_mask,
+        )
         total_loss = (
             ar_loss
             + 0.2 * hier_loss
             + 0.01 * sparse_loss
             + config.model.copy_recent_weight * copy_r_loss
             + config.model.copy_episodic_weight * ptr_loss
+            + config.model.graph_blend * graph_loss
         )
         total_loss.backward()
         optimizer.step()
@@ -178,8 +261,11 @@ def command_smoke_train(args: argparse.Namespace) -> int:
                     "sparse_loss": float(sparse_loss.item()),
                     "copy_r_loss": float(copy_r_loss.item()),
                     "ptr_loss": float(ptr_loss.item()),
+                    "graph_loss": float(graph_loss.item()),
                     "copy_target_hits": float(output.memory_stats["copy_target_hits"]),
                     "episodic_target_hits": float(output.memory_stats["episodic_target_hits"]),
+                    "graph_copy_hits": float(output.memory_stats["graph_copy_hits"]),
+                    "graph_reads": float(output.memory_stats["graph_reads"]),
                     "registry_size": batch.registry_size,
                 }
             )
@@ -200,21 +286,29 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser = subparsers.add_parser("inspect")
     inspect_parser.add_argument("file_path")
     inspect_parser.add_argument("--config")
+    inspect_parser.add_argument("--repo-root")
+    inspect_parser.add_argument("--report-path", action="append", default=[])
     inspect_parser.set_defaults(func=command_inspect)
 
     inspect_structure_parser = subparsers.add_parser("inspect-structure")
     inspect_structure_parser.add_argument("file_path")
     inspect_structure_parser.add_argument("--config")
+    inspect_structure_parser.add_argument("--repo-root")
+    inspect_structure_parser.add_argument("--report-path", action="append", default=[])
     inspect_structure_parser.set_defaults(func=command_inspect)
 
     forward_parser = subparsers.add_parser("run-forward")
     forward_parser.add_argument("file_path")
     forward_parser.add_argument("--config")
+    forward_parser.add_argument("--repo-root")
+    forward_parser.add_argument("--report-path", action="append", default=[])
     forward_parser.set_defaults(func=command_run_forward)
 
     smoke_parser = subparsers.add_parser("smoke-train")
     smoke_parser.add_argument("--config")
     smoke_parser.add_argument("--steps", type=int, default=2)
+    smoke_parser.add_argument("--repo-root")
+    smoke_parser.add_argument("--report-path", action="append", default=[])
     smoke_parser.add_argument("files", nargs="*")
     smoke_parser.set_defaults(func=command_smoke_train)
     return parser

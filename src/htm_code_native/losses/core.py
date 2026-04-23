@@ -57,3 +57,14 @@ def episodic_pointer_loss(
         device = targets.device if isinstance(targets, torch.Tensor) else None
         return torch.tensor(0.0, device=device)
     return F.nll_loss(eem_logits[episodic_target_mask], targets[episodic_target_mask])
+
+
+def graph_copy_loss(
+    graph_logits: torch.Tensor | None,
+    targets: torch.Tensor,
+    graph_copy_target_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if graph_logits is None or graph_copy_target_mask is None or not bool(graph_copy_target_mask.any().item()):
+        device = targets.device if isinstance(targets, torch.Tensor) else None
+        return torch.tensor(0.0, device=device)
+    return F.nll_loss(graph_logits[graph_copy_target_mask], targets[graph_copy_target_mask])

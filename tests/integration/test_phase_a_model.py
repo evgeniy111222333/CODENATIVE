@@ -3,7 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from htm_code_native.cli import main
-from htm_code_native.losses.core import autoregressive_loss, recent_copy_loss
+from htm_code_native.losses.core import (
+    autoregressive_loss,
+    episodic_pointer_loss,
+    recent_copy_loss,
+)
 from htm_code_native.model.phase_a import PhaseACodeModel
 
 
