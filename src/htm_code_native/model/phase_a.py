@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from pathlib import Path
 
 import torch
 from torch import nn
 
 from htm_code_native.config.settings import HTMCodeNativeConfig
-from htm_code_native.data.types import HSSMState, PhaseABatch, PhaseAOutput, RepoGraphQueryContext, RepositoryGraphIndex
+from htm_code_native.data.types import HSSMState, PhaseABatch, PhaseAOutput, RepoGraphQueryContext, RepositoryGraphIndex, RouterFeatures, TokenClass
 from htm_code_native.encoders.code import CodeAwareEmbedding
-from htm_code_native.memory.exact_episodic import ExactEpisodicMemory
 from htm_code_native.hssm.core import HSSMCore
+from htm_code_native.memory.exact_episodic import ExactEpisodicMemory
 from htm_code_native.memory.exact_recent import ExactRecentMemory
 from htm_code_native.memory.repo_graph import RepositoryGraphMemory
 from htm_code_native.memory.semantic.store import SemanticMemory
+from htm_code_native.router.stub import TwoStageRouter
 
 
 class PhaseACodeModel(nn.Module):
@@ -21,20 +23,13 @@ class PhaseACodeModel(nn.Module):
         super().__init__()
         if config.model.model_dim != config.hssm.hidden_size:
             raise ValueError("Phase A expects model.model_dim == hssm.hidden_size.")
-        if (
-            config.model.semantic_blend
-            + config.model.erm_blend
-            + config.model.eem_blend
-            + config.model.graph_blend
-            > 1.0
-        ):
-            raise ValueError("semantic_blend + erm_blend + eem_blend + graph_blend must not exceed 1.0.")
 
         self.config = config
         hidden_size = config.model.model_dim
         num_levels = config.hssm.num_levels
         master_dim = hidden_size * num_levels
         self.repo_graph_root: Path | None = None
+        self.router_metadata_dim = 21
 
         self.encoder = CodeAwareEmbedding(config)
         self.hssm = HSSMCore(config.hssm)
@@ -66,6 +61,28 @@ class PhaseACodeModel(nn.Module):
             symbol_bias=config.model.graph_symbol_bias,
             test_bias=config.model.graph_test_bias,
             diagnostic_bias=config.model.graph_diagnostic_bias,
+            value_dim=config.model.graph_value_dim,
+        )
+        self.router = TwoStageRouter(
+            pre_feature_dim=master_dim + hidden_size + self.router_metadata_dim,
+            post_feature_dim=master_dim + hidden_size + self.router_metadata_dim + 5,
+            pre_hidden_dim=config.model.pre_router_hidden_dim,
+            post_hidden_dim=config.model.post_router_hidden_dim,
+            temperature=config.model.route_temperature,
+            route_top_k=config.model.route_top_k,
+            thresholds=(
+                config.model.route_threshold_cold_semantic,
+                config.model.route_threshold_eem,
+                config.model.route_threshold_graph,
+            ),
+            lane_costs=(
+                config.model.lane_cost_lm,
+                config.model.lane_cost_semantic_hot,
+                config.model.lane_cost_erm,
+                config.model.lane_cost_semantic_cold,
+                config.model.lane_cost_eem,
+                config.model.lane_cost_graph,
+            ),
         )
 
         self.master_norm = nn.LayerNorm(master_dim)
@@ -75,6 +92,8 @@ class PhaseACodeModel(nn.Module):
         )
         self.skip_projection = nn.Linear(hidden_size, hidden_size)
         self.semantic_projection = nn.Linear(hidden_size, hidden_size)
+        self.graph_out_projection = nn.Linear(config.model.graph_value_dim, hidden_size)
+        self.graph_query_projection = nn.Linear(hidden_size * 2, hidden_size)
         self.hidden_ffn = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 2),
@@ -98,51 +117,45 @@ class PhaseACodeModel(nn.Module):
         self.semantic_memory.reset()
         self.exact_recent_memory.reset()
         self.repo_graph_memory.reset()
+        self.router.reset()
         if reset_eem:
             self.exact_episodic_memory.reset()
 
         seq_len = embeddings.shape[0]
         num_levels = self.config.hssm.num_levels
         hidden_size = self.config.model.model_dim
+        device = embeddings.device
+        token_counts = Counter(token.value if token.value else token.token_type for token in batch.document.tokens)
 
-        hidden_states = torch.zeros(seq_len, hidden_size, device=embeddings.device)
-        semantic_contexts = torch.zeros(seq_len, hidden_size, device=embeddings.device)
-        logits = torch.zeros(
-            seq_len,
-            self.config.model.vocabulary_size,
-            device=embeddings.device,
-        )
+        base_hidden_states = torch.zeros(seq_len, hidden_size, device=device)
+        hidden_states = torch.zeros(seq_len, hidden_size, device=device)
+        semantic_contexts = torch.zeros(seq_len, hidden_size, device=device)
+        graph_contexts = torch.zeros(seq_len, self.config.model.graph_value_dim, device=device)
+        logits = torch.zeros(seq_len, self.config.model.vocabulary_size, device=device)
         lm_logits = torch.zeros_like(logits)
-        semantic_logits = (
-            torch.zeros_like(logits) if self.semantic_head is not None else None
-        )
+        semantic_logits = torch.zeros_like(logits) if self.semantic_head is not None else None
         erm_logits = torch.full_like(logits, fill_value=math.log(1e-8))
-        erm_attention = torch.zeros(
-            seq_len,
-            self.config.model.recent_window,
-            device=embeddings.device,
-        )
-        copy_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=embeddings.device)
         eem_logits = torch.full_like(logits, fill_value=math.log(1e-8))
-        eem_attention = torch.zeros(
-            seq_len,
-            self.config.model.eem_top_k,
-            device=embeddings.device,
-        )
+        graph_logits = torch.full_like(logits, fill_value=math.log(1e-8))
+        erm_attention = torch.zeros(seq_len, self.config.model.recent_window, device=device)
+        eem_attention = torch.zeros(seq_len, self.config.model.eem_top_k, device=device)
         pointer_attention = torch.zeros(
             seq_len,
             self.config.model.eem_top_k * self.config.model.max_chunk_tokens,
-            device=embeddings.device,
+            device=device,
         )
-        episodic_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=embeddings.device)
-        graph_logits = torch.full_like(logits, fill_value=math.log(1e-8))
-        graph_attention = torch.zeros(
-            seq_len,
-            self.config.model.graph_top_k,
-            device=embeddings.device,
-        )
-        graph_copy_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=embeddings.device)
-        entropy_tensor = torch.zeros(seq_len, num_levels, device=embeddings.device)
+        graph_attention = torch.zeros(seq_len, self.config.model.graph_top_k, device=device)
+        copy_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        episodic_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        graph_copy_target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        entropy_tensor = torch.zeros(seq_len, num_levels, device=device)
+        lane_entropies = torch.zeros(seq_len, 5, device=device)
+        router_weights = torch.zeros(seq_len, 5, device=device)
+        router_pre_mask = torch.zeros(seq_len, 6, dtype=torch.bool, device=device)
+        router_post_mask = torch.zeros(seq_len, 5, dtype=torch.bool, device=device)
+        invoked_lanes = torch.zeros(seq_len, 6, dtype=torch.bool, device=device)
+        energy_proxy = torch.zeros(seq_len, device=device)
+
         total_hot_reads = 0
         total_cold_reads = 0
         total_maintenance = 0
@@ -162,10 +175,22 @@ class PhaseACodeModel(nn.Module):
         total_graph_test_hits = 0
         total_graph_diagnostic_hits = 0
         graph_copy_hits = 0
+        graph_fusion_steps = 0
+        cold_semantic_invocations = 0
+        eem_invocations = 0
+        graph_invocations = 0
+        symbol_link_hits = 0
         current_chunk_start = 0
+        previous_lane_stats = torch.zeros(5, device=device)
         graph_candidate_ids: list[tuple[str, ...]] = []
         graph_candidate_kinds: list[tuple[str, ...]] = []
         graph_candidate_names: list[tuple[str, ...]] = []
+        graph_candidate_scores: list[torch.Tensor] = []
+        graph_target_node_ids: list[str | None] = []
+        route_teacher_indices: list[int] = []
+        route_teacher_expensive: list[tuple[int, int, int]] = []
+        router_pre_logits: list[torch.Tensor] = []
+        router_post_logits: list[torch.Tensor] = []
 
         for step in range(seq_len):
             step_level_states = [
@@ -177,41 +202,109 @@ class PhaseACodeModel(nn.Module):
                 master_state=hssm_output.master_states[step],
                 step_index=step,
             )
-            read_result = self.semantic_memory.read_write(
-                step_state,
-                budget=self.config.semantic_memory.maintenance_budget,
-            )
-            total_hot_reads += read_result.hot_reads
-            total_cold_reads += read_result.cold_reads
-            total_maintenance += read_result.maintenance_invocations
 
-            gamma = torch.softmax(
-                (self.level_gate_vectors @ self.master_norm(step_state.master_state))
-                / math.sqrt(self.config.model.model_dim),
-                dim=0,
+            hot_outputs, hot_entropies, hot_reads = self.semantic_memory.read_hot(step_state)
+            hot_context = self._aggregate_semantic_context(step_state.master_state, hot_outputs)
+            base_hidden = self.hidden_ffn(
+                self.semantic_projection(hot_context)
+                + self.skip_projection(hssm_output.level_states[step, 0])
             )
-            stacked_outputs = torch.stack(read_result.per_level_outputs, dim=0)
-            projected_outputs = torch.stack(
+
+            cold_available = any(self.semantic_memory.cold_clusters[level] for level in range(num_levels))
+            eem_available = bool(self.exact_episodic_memory.chunks)
+            graph_available = bool(self.repo_graph_memory.index and self.repo_graph_memory.index.nodes)
+            metadata = self._router_metadata(
+                batch=batch,
+                step=step,
+                token_counts=token_counts,
+                previous_lane_stats=previous_lane_stats,
+                availability=(cold_available, eem_available, graph_available),
+            )
+            pre_features = torch.cat(
+                [self.master_norm(step_state.master_state), base_hidden, metadata],
+                dim=-1,
+            )
+
+            cold_context = torch.zeros(hidden_size, device=device)
+            cold_entropies: dict[int, float] = {level: 0.0 for level in range(num_levels)}
+            cold_reads = 0
+            graph_result = self.repo_graph_memory.query(
+                hidden=torch.zeros(hidden_size, device=device),
+                context=self._graph_query_context(batch, step),
+                vocabulary_snapshot=batch.vocabulary_snapshot,
+            ) if False else None
+            zero_graph_distribution = torch.zeros(self.config.model.vocabulary_size, device=device)
+            zero_graph_log_distribution = torch.full(
+                (self.config.model.vocabulary_size,),
+                fill_value=math.log(1e-8),
+                device=device,
+            )
+
+            availability_mask = torch.tensor(
+                [cold_available, eem_available, graph_available],
+                dtype=torch.bool,
+                device=device,
+            )
+            placeholder_post_features = torch.cat(
                 [
-                    self.level_output_projections[level](stacked_outputs[level])
-                    for level in range(num_levels)
+                    self.master_norm(step_state.master_state),
+                    base_hidden,
+                    metadata,
+                    torch.zeros(5, device=device),
                 ],
-                dim=0,
+                dim=-1,
             )
-            semantic_context = torch.sum(gamma.unsqueeze(-1) * projected_outputs, dim=0)
+            router_decision = self.router.route(
+                RouterFeatures(
+                    pre_features=pre_features,
+                    post_features=placeholder_post_features,
+                    availability_mask=availability_mask,
+                )
+            )
+
+            if bool(router_decision.pre_mask[3].item()) and cold_available:
+                cold_outputs, cold_entropies, cold_reads = self.semantic_memory.read_cold(step_state)
+                cold_context = self._aggregate_semantic_context(step_state.master_state, cold_outputs)
+                cold_semantic_invocations += 1
+            else:
+                cold_outputs = [torch.zeros(hidden_size, device=device) for _ in range(num_levels)]
+
+            graph_query_hidden = self.graph_query_projection(
+                torch.cat([base_hidden, encoder_parts["struct_component"][step]], dim=-1)
+            )
+            if bool(router_decision.pre_mask[5].item()) and graph_available:
+                graph_result = self.repo_graph_memory.query(
+                    hidden=graph_query_hidden,
+                    context=self._graph_query_context(batch, step),
+                    vocabulary_snapshot=batch.vocabulary_snapshot,
+                )
+                graph_invocations += 1
+                graph_fusion_steps += int(graph_result.retrieved_count > 0)
+            else:
+                graph_result = None
+
+            graph_context = (
+                graph_result.graph_context
+                if graph_result is not None and graph_result.retrieved_count > 0
+                else torch.zeros(self.config.model.graph_value_dim, device=device)
+            )
+            semantic_context = hot_context + cold_context + (
+                self.config.model.graph_out_blend * self.graph_out_projection(graph_context)
+            )
             hidden = self.hidden_ffn(
                 self.semantic_projection(semantic_context)
                 + self.skip_projection(hssm_output.level_states[step, 0])
             )
+
             step_lm_logits = self.vocab_head(hidden)
             lm_probabilities = torch.softmax(step_lm_logits, dim=-1)
-            semantic_probabilities = None
             if self.semantic_head is not None:
                 step_semantic_logits = self.semantic_head(semantic_context)
-                semantic_logits[step] = step_semantic_logits
                 semantic_probabilities = torch.softmax(step_semantic_logits, dim=-1)
+                semantic_logits[step] = step_semantic_logits
             else:
                 step_semantic_logits = None
+                semantic_probabilities = None
 
             payload_length = int(batch.token_payload_lengths[step].item())
             token_span = batch.token_spans[step].tolist()
@@ -224,19 +317,12 @@ class PhaseACodeModel(nn.Module):
                 timestamp=step,
             )
             exact_recent_result = self.exact_recent_memory.read(hidden)
-            erm_logits[step] = exact_recent_result.log_distribution
-            erm_attention[step] = exact_recent_result.attention
             total_erm_reads += exact_recent_result.read_count
             total_erm_writes += 1
             total_erm_overwrites += int(overwrite)
+            erm_logits[step] = exact_recent_result.log_distribution
+            erm_attention[step] = exact_recent_result.attention
 
-            if step < seq_len - 1:
-                target_token_id = int(batch.targets[step].item())
-                has_copy_target = bool((exact_recent_result.slot_token_ids == target_token_id).any().item())
-                copy_target_mask[step] = has_copy_target
-                copy_target_hits += int(has_copy_target)
-
-            finalized_chunk = None
             chunk_type = self._chunk_type_for_step(batch, step, current_chunk_start)
             if chunk_type is not None:
                 finalized_chunk = self.exact_episodic_memory.maybe_finalize_chunk(
@@ -252,105 +338,179 @@ class PhaseACodeModel(nn.Module):
                     total_chunks_finalized += 1
                     current_chunk_start = step + 1
 
-            exact_episodic_result = self.exact_episodic_memory.retrieve(hidden)
+            if bool(router_decision.pre_mask[4].item()) and bool(self.exact_episodic_memory.chunks):
+                exact_episodic_result = self.exact_episodic_memory.retrieve(hidden)
+                eem_invocations += 1
+            else:
+                exact_episodic_result = self.exact_episodic_memory.retrieve(
+                    torch.zeros_like(hidden)
+                ) if False else self._empty_eem_result(device)
             eem_logits[step] = exact_episodic_result.log_distribution
             eem_attention[step] = exact_episodic_result.chunk_attention
             pointer_attention[step] = exact_episodic_result.pointer_attention
             total_eem_reads += exact_episodic_result.read_count
             total_chunk_overhead += exact_episodic_result.chunk_overhead
 
+            if graph_result is not None:
+                graph_logits[step] = graph_result.log_distribution
+                graph_attention[step] = graph_result.attention
+                graph_candidate_ids.append(graph_result.candidate_node_ids)
+                graph_candidate_kinds.append(graph_result.candidate_kinds)
+                graph_candidate_names.append(graph_result.candidate_names)
+                graph_candidate_scores.append(graph_result.candidate_scores)
+                total_graph_reads += graph_result.read_count
+                total_graph_candidates += graph_result.candidate_count
+                total_graph_samefile_hits += graph_result.samefile_hits
+                total_graph_import_hits += graph_result.import_hits
+                total_graph_symbol_hits += graph_result.symbol_hits
+                total_graph_test_hits += graph_result.test_hits
+                total_graph_diagnostic_hits += graph_result.diagnostic_hits
+            else:
+                graph_logits[step] = zero_graph_log_distribution
+                graph_attention[step] = torch.zeros(self.config.model.graph_top_k, device=device)
+                graph_candidate_ids.append(())
+                graph_candidate_kinds.append(())
+                graph_candidate_names.append(())
+                graph_candidate_scores.append(torch.zeros(0, device=device))
+
+            semantic_entropy_value = self._distribution_entropy(
+                semantic_probabilities if semantic_probabilities is not None else lm_probabilities
+            )
+            erm_entropy_value = self._distribution_entropy(exact_recent_result.distribution)
+            eem_entropy_value = self._distribution_entropy(exact_episodic_result.distribution)
+            graph_entropy_value = self._distribution_entropy(
+                graph_result.distribution if graph_result is not None else zero_graph_distribution
+            )
+            lm_entropy_value = self._distribution_entropy(lm_probabilities)
+            lane_entropy = torch.tensor(
+                [
+                    lm_entropy_value,
+                    semantic_entropy_value,
+                    erm_entropy_value,
+                    eem_entropy_value,
+                    graph_entropy_value,
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+            lane_entropies[step] = lane_entropy
+
+            post_features = torch.cat(
+                [
+                    self.master_norm(step_state.master_state),
+                    hidden,
+                    metadata,
+                    lane_entropy,
+                ],
+                dim=-1,
+            )
+            router_decision = self.router.route(
+                RouterFeatures(
+                    pre_features=pre_features,
+                    post_features=post_features,
+                    availability_mask=availability_mask,
+                )
+            )
+            router_pre_logits.append(router_decision.pre_logits)
+            router_post_logits.append(router_decision.post_logits)
+            router_pre_mask[step] = router_decision.pre_mask
+            invoked_lanes[step] = router_decision.pre_mask
+            router_post_mask[step] = router_decision.post_mask
+            router_weights[step] = router_decision.weights
+            energy_proxy[step] = router_decision.energy_proxy + (
+                self.config.model.maintenance_cost * 0.0
+            )
+
+            blended_probabilities = (
+                router_decision.weights[0] * lm_probabilities
+                + router_decision.weights[1]
+                * (
+                    semantic_probabilities
+                    if semantic_probabilities is not None
+                    else lm_probabilities
+                )
+                + router_decision.weights[2] * exact_recent_result.distribution
+                + router_decision.weights[3] * exact_episodic_result.distribution
+                + router_decision.weights[4]
+                * (
+                    graph_result.distribution
+                    if graph_result is not None
+                    else zero_graph_distribution
+                )
+            )
+            logits[step] = torch.log(blended_probabilities.clamp_min(1e-8))
+
+            lm_logits[step] = step_lm_logits
+            base_hidden_states[step] = base_hidden
+            hidden_states[step] = hidden
+            semantic_contexts[step] = semantic_context
+            graph_contexts[step] = graph_context
+
+            for level in range(num_levels):
+                entropy_tensor[step, level] = hot_entropies.get(level, 0.0) + cold_entropies.get(level, 0.0)
+
             if step < seq_len - 1:
                 target_token_id = int(batch.targets[step].item())
+                has_copy_target = bool((exact_recent_result.slot_token_ids == target_token_id).any().item())
+                copy_target_mask[step] = has_copy_target
+                copy_target_hits += int(has_copy_target)
+
                 has_episodic_target = bool(
                     (exact_episodic_result.pointer_token_ids == target_token_id).any().item()
                 )
                 episodic_target_mask[step] = has_episodic_target
                 episodic_target_hits += int(has_episodic_target)
 
-            structure = batch.document.token_structures[step]
-            graph_context = RepoGraphQueryContext(
-                file_path=self._normalize_graph_path(structure.file_id),
-                current_symbol_id=structure.symbol_id,
-                current_symbol_name=structure.symbol_name,
-                scope_path=structure.scope_path,
-                token_value=batch.document.tokens[step].value,
-                token_class=batch.document.tokens[step].token_class.value,
-            )
-            graph_result = self.repo_graph_memory.query(
-                hidden,
-                graph_context,
-                batch.vocabulary_snapshot,
-            )
-            graph_logits[step] = graph_result.log_distribution
-            graph_attention[step] = graph_result.attention
-            graph_candidate_ids.append(graph_result.candidate_node_ids)
-            graph_candidate_kinds.append(graph_result.candidate_kinds)
-            graph_candidate_names.append(graph_result.candidate_names)
-            total_graph_reads += graph_result.read_count
-            total_graph_candidates += graph_result.candidate_count
-            total_graph_samefile_hits += graph_result.samefile_hits
-            total_graph_import_hits += graph_result.import_hits
-            total_graph_symbol_hits += graph_result.symbol_hits
-            total_graph_test_hits += graph_result.test_hits
-            total_graph_diagnostic_hits += graph_result.diagnostic_hits
+                next_structure = batch.document.token_structures[step + 1]
+                graph_target_node_id = None
+                if graph_result is not None:
+                    has_graph_copy = bool((graph_result.copy_token_ids == target_token_id).any().item())
+                    graph_copy_target_mask[step] = has_graph_copy
+                    graph_copy_hits += int(has_graph_copy)
+                    graph_target_node_id = self._resolve_graph_target_node(
+                        next_structure.symbol_id,
+                        next_structure.symbol_name,
+                        graph_result.candidate_node_ids,
+                        graph_result.candidate_names,
+                    )
+                    symbol_link_hits += int(graph_target_node_id is not None)
+                graph_target_node_ids.append(graph_target_node_id)
 
-            if step < seq_len - 1 and graph_result.copy_token_ids.numel() > 0:
-                target_token_id = int(batch.targets[step].item())
-                has_graph_copy = bool((graph_result.copy_token_ids == target_token_id).any().item())
-                graph_copy_target_mask[step] = has_graph_copy
-                graph_copy_hits += int(has_graph_copy)
+                teacher_index, teacher_expensive = self._route_teacher(
+                    batch=batch,
+                    step=step,
+                    copy_hit=has_copy_target,
+                    episodic_hit=has_episodic_target,
+                    graph_hit=bool(graph_copy_target_mask[step].item()) or graph_target_node_id is not None,
+                )
+                route_teacher_indices.append(teacher_index)
+                route_teacher_expensive.append(teacher_expensive)
+            else:
+                graph_target_node_ids.append(None)
+                route_teacher_indices.append(0)
+                route_teacher_expensive.append((0, 0, 0))
 
-            semantic_weight = (
-                self.config.model.semantic_blend if semantic_probabilities is not None else 0.0
+            self.semantic_memory.write_hot(step_state)
+            total_maintenance += self.semantic_memory.consolidate(
+                self.config.semantic_memory.maintenance_budget,
+                step_state.step_index,
             )
-            erm_weight = (
-                self.config.model.erm_blend if exact_recent_result.filled_size > 0 else 0.0
-            )
-            eem_weight = (
-                self.config.model.eem_blend if exact_episodic_result.retrieved_chunk_count > 0 else 0.0
-            )
-            graph_weight = (
-                self.config.model.graph_blend if graph_result.retrieved_count > 0 else 0.0
-            )
-            lm_weight = 1.0 - semantic_weight - erm_weight - eem_weight - graph_weight
-            if lm_weight < 0.0:
-                lm_weight = 0.0
-            total_weight = lm_weight + semantic_weight + erm_weight + eem_weight + graph_weight
-            if total_weight == 0.0:
-                total_weight = 1.0
-                lm_weight = 1.0
-
-            blended_probabilities = (lm_weight / total_weight) * lm_probabilities
-            if semantic_probabilities is not None:
-                blended_probabilities = blended_probabilities + (
-                    semantic_weight / total_weight
-                ) * semantic_probabilities
-            if exact_recent_result.filled_size > 0:
-                blended_probabilities = blended_probabilities + (
-                    erm_weight / total_weight
-                ) * exact_recent_result.distribution
-            if exact_episodic_result.retrieved_chunk_count > 0:
-                blended_probabilities = blended_probabilities + (
-                    eem_weight / total_weight
-                ) * exact_episodic_result.distribution
-            if graph_result.retrieved_count > 0:
-                blended_probabilities = blended_probabilities + (
-                    graph_weight / total_weight
-                ) * graph_result.distribution
-            blended = torch.log(blended_probabilities.clamp_min(1e-8))
-
-            lm_logits[step] = step_lm_logits
-            hidden_states[step] = hidden
-            semantic_contexts[step] = semantic_context
-            logits[step] = blended
-            for level, entropy in read_result.entropies.items():
-                entropy_tensor[step, level] = entropy
+            total_hot_reads += hot_reads
+            total_cold_reads += cold_reads
+            previous_lane_stats = lane_entropy.detach()
 
         diagnostics = {
             "mean_update_rate": float(hssm_output.update_mask.float().mean().item()),
             "mean_entropy": float(entropy_tensor.mean().item()),
             "embedding_norm": float(embeddings.norm(dim=-1).mean().item()),
+            "route_entropy": float(self._distribution_entropy(router_weights.mean(dim=0))),
+            "energy_proxy": float(energy_proxy.mean().item()),
         }
+        always_on_energy = (
+            self.config.model.lane_cost_lm
+            + self.config.model.lane_cost_semantic_hot
+            + self.config.model.lane_cost_erm
+        )
         memory_stats = {
             "hot_reads": float(total_hot_reads),
             "cold_reads": float(total_cold_reads),
@@ -373,6 +533,16 @@ class PhaseACodeModel(nn.Module):
             "graph_symbol_hits": float(total_graph_symbol_hits),
             "graph_test_hits": float(total_graph_test_hits),
             "graph_diagnostic_hits": float(total_graph_diagnostic_hits),
+            "graph_fusion_steps": float(graph_fusion_steps),
+            "cold_semantic_invocations": float(cold_semantic_invocations),
+            "eem_invocations": float(eem_invocations),
+            "graph_invocations": float(graph_invocations),
+            "symbol_link_hits": float(symbol_link_hits),
+            "avg_energy_proxy": float(energy_proxy.mean().item()),
+            "always_on_energy": float(always_on_energy),
+            "avg_skipped_expensive_reads": float(
+                (~router_pre_mask[:, 3:]).float().sum(dim=-1).mean().item()
+            ),
         }
 
         return PhaseAOutput(
@@ -389,6 +559,14 @@ class PhaseACodeModel(nn.Module):
             graph_logits=graph_logits,
             graph_attention=graph_attention,
             graph_copy_target_mask=graph_copy_target_mask,
+            base_hidden_states=base_hidden_states,
+            graph_contexts=graph_contexts,
+            router_weights=router_weights,
+            router_pre_mask=router_pre_mask,
+            router_post_mask=router_post_mask,
+            lane_entropies=lane_entropies,
+            invoked_lanes=invoked_lanes,
+            energy_proxy=energy_proxy,
             hidden_states=hidden_states,
             semantic_contexts=semantic_contexts,
             diagnostics=diagnostics,
@@ -404,7 +582,168 @@ class PhaseACodeModel(nn.Module):
                 "graph_candidate_ids": graph_candidate_ids,
                 "graph_candidate_kinds": graph_candidate_kinds,
                 "graph_candidate_names": graph_candidate_names,
+                "graph_candidate_scores": graph_candidate_scores,
+                "graph_target_node_ids": graph_target_node_ids,
+                "route_teacher_indices": route_teacher_indices,
+                "route_teacher_expensive": route_teacher_expensive,
+                "router_pre_logits": router_pre_logits,
+                "router_post_logits": router_post_logits,
             },
+        )
+
+    def _aggregate_semantic_context(
+        self,
+        master_state: torch.Tensor,
+        per_level_outputs: list[torch.Tensor],
+    ) -> torch.Tensor:
+        gamma = torch.softmax(
+            (self.level_gate_vectors @ self.master_norm(master_state))
+            / math.sqrt(self.config.model.model_dim),
+            dim=0,
+        )
+        stacked_outputs = torch.stack(per_level_outputs, dim=0)
+        projected_outputs = torch.stack(
+            [
+                self.level_output_projections[level](stacked_outputs[level])
+                for level in range(self.config.hssm.num_levels)
+            ],
+            dim=0,
+        )
+        return torch.sum(gamma.unsqueeze(-1) * projected_outputs, dim=0)
+
+    def _graph_query_context(self, batch: PhaseABatch, step: int) -> RepoGraphQueryContext:
+        structure = batch.document.token_structures[step]
+        return RepoGraphQueryContext(
+            file_path=self._normalize_graph_path(structure.file_id),
+            current_symbol_id=structure.symbol_id,
+            current_symbol_name=structure.symbol_name,
+            scope_path=structure.scope_path,
+            token_value=batch.document.tokens[step].value,
+            token_class=batch.document.tokens[step].token_class.value,
+        )
+
+    def _router_metadata(
+        self,
+        batch: PhaseABatch,
+        step: int,
+        token_counts: Counter[str],
+        previous_lane_stats: torch.Tensor,
+        availability: tuple[bool, bool, bool],
+    ) -> torch.Tensor:
+        token = batch.document.tokens[step]
+        syntax = batch.document.syntax_features[step]
+        rarity = 1.0 / max(token_counts.get(token.value if token.value else token.token_type, 1), 1)
+        control_flag = float(token.token_class in {TokenClass.NEWLINE, TokenClass.INDENT, TokenClass.DEDENT})
+        features = torch.tensor(
+            [
+                batch.token_class_ids[step].item() / max(len(TokenClass) - 1, 1),
+                rarity,
+                float(token.token_class == TokenClass.STRING),
+                float(token.token_class == TokenClass.NUMBER),
+                float(token.token_class == TokenClass.COMMENT),
+                float(token.token_class == TokenClass.KEYWORD),
+                control_flag,
+                min(float(syntax.depth) / 32.0, 1.0),
+                min(float(syntax.block_depth) / 16.0, 1.0),
+                float(syntax.inside_call),
+                float(syntax.inside_literal),
+                float(syntax.inside_comment),
+                batch.language_ids[step].item() / 7.0,
+                float(availability[0]),
+                float(availability[1]),
+                float(availability[2]),
+                float(previous_lane_stats[0].item()),
+                float(previous_lane_stats[1].item()),
+                float(previous_lane_stats[2].item()),
+                float(previous_lane_stats[3].item()),
+                float(previous_lane_stats[4].item()),
+            ],
+            dtype=torch.float32,
+            device=batch.token_ids.device,
+        )
+        return features
+
+    def _distribution_entropy(self, distribution: torch.Tensor) -> float:
+        if distribution.numel() == 0:
+            return 0.0
+        normalized = distribution / distribution.sum().clamp_min(1e-8)
+        return float((-normalized * torch.log(normalized.clamp_min(1e-8))).sum().item())
+
+    def _route_teacher(
+        self,
+        batch: PhaseABatch,
+        step: int,
+        copy_hit: bool,
+        episodic_hit: bool,
+        graph_hit: bool,
+    ) -> tuple[int, tuple[int, int, int]]:
+        token = batch.document.tokens[step]
+        if copy_hit:
+            return 2, (0, 0, 0)
+        if episodic_hit:
+            return 3, (0, 1, 0)
+        if graph_hit:
+            return 4, (0, 0, 1)
+        if token.token_class in {
+            TokenClass.KEYWORD,
+            TokenClass.OPERATOR,
+            TokenClass.DELIMITER,
+            TokenClass.NEWLINE,
+            TokenClass.INDENT,
+            TokenClass.DEDENT,
+            TokenClass.COMMENT,
+        }:
+            return 1, (1, 0, 0)
+        return 0, (0, 0, 0)
+
+    def _resolve_graph_target_node(
+        self,
+        target_symbol_id: str | None,
+        target_symbol_name: str | None,
+        candidate_node_ids: tuple[str, ...],
+        candidate_names: tuple[str, ...],
+    ) -> str | None:
+        if target_symbol_id is not None and target_symbol_id in candidate_node_ids:
+            return target_symbol_id
+        if target_symbol_name is None:
+            return None
+        for candidate_id, candidate_name in zip(candidate_node_ids, candidate_names, strict=False):
+            if candidate_name == target_symbol_name:
+                return candidate_id
+        return None
+
+    def _empty_eem_result(self, device: torch.device):
+        from htm_code_native.data.types import ExactEpisodicReadResult
+
+        return ExactEpisodicReadResult(
+            distribution=torch.zeros(self.config.model.vocabulary_size, device=device),
+            log_distribution=torch.full(
+                (self.config.model.vocabulary_size,),
+                fill_value=math.log(1e-8),
+                device=device,
+            ),
+            chunk_attention=torch.zeros(self.config.model.eem_top_k, device=device),
+            pointer_attention=torch.zeros(
+                self.config.model.eem_top_k * self.config.model.max_chunk_tokens,
+                device=device,
+            ),
+            retrieved_chunk_ids=torch.full(
+                (self.config.model.eem_top_k,),
+                fill_value=-1,
+                dtype=torch.long,
+                device=device,
+            ),
+            pointer_token_ids=torch.full(
+                (self.config.model.eem_top_k * self.config.model.max_chunk_tokens,),
+                fill_value=-1,
+                dtype=torch.long,
+                device=device,
+            ),
+            retrieved_chunk_count=0,
+            read_count=0,
+            chunks_finalized=self.exact_episodic_memory.total_chunks_finalized,
+            chunk_overhead=0.0,
+            stored_chunks=len(self.exact_episodic_memory.chunks),
         )
 
     def _chunk_type_for_step(self, batch: PhaseABatch, step: int, current_chunk_start: int) -> str | None:

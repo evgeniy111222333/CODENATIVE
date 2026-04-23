@@ -9,6 +9,16 @@ from htm_code_native.utils.hashing import stable_int_hash
 
 
 TOKEN_CLASS_TO_ID = {token_class: index for index, token_class in enumerate(TokenClass)}
+LANGUAGE_TO_ID = {
+    "python": 0,
+    "javascript": 1,
+    "typescript": 2,
+    "json": 3,
+    "yaml": 4,
+    "toml": 5,
+    "ini": 6,
+    "config": 7,
+}
 
 
 def build_batch_from_document(
@@ -31,7 +41,16 @@ def build_batch_from_document(
         [TOKEN_CLASS_TO_ID[token.token_class] for token in document.tokens],
         dtype=torch.long,
     )
-    language_ids = torch.zeros(seq_len, dtype=torch.long)
+    language_ids = torch.tensor(
+        [
+            LANGUAGE_TO_ID.get(
+                document.syntax_features[index].parser_language if index < len(document.syntax_features) else document.language,
+                LANGUAGE_TO_ID["config"],
+            )
+            for index in range(seq_len)
+        ],
+        dtype=torch.long,
+    )
     scope_ids = torch.tensor(
         [
             stable_int_hash("/".join(info.scope_path) or "module", vocab_size)

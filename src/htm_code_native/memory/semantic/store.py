@@ -38,38 +38,81 @@ class SemanticMemory(nn.Module):
             level: [] for level in range(self.hssm_config.num_levels)
         }
 
-    def read_write(self, step_state: HSSMState, budget: float) -> SemanticReadResult:
+    def read_hot(
+        self,
+        step_state: HSSMState,
+    ) -> tuple[list[torch.Tensor], dict[int, float], int]:
         device = step_state.master_state.device
         per_level_outputs: list[torch.Tensor] = []
         entropies: dict[int, float] = {}
-        hot_reads = 0
-        cold_reads = 0
-        maintenance_invocations = 0
+        read_count = 0
 
-        for level, level_state in enumerate(step_state.level_states):
+        for level, _level_state in enumerate(step_state.level_states):
             query = self.query_projections[level](step_state.master_state)
-            hot_output, hot_entropy, hot_count = self._read_hot(level, query, device)
-            cold_output, cold_entropy, cold_count = self._read_cold(level, query, device)
-            combined = self.output_projections[level](hot_output + cold_output)
-            per_level_outputs.append(combined)
-            entropies[level] = hot_entropy + cold_entropy
-            hot_reads += hot_count
-            cold_reads += cold_count
+            output, entropy, count = self._read_hot_level(level, query, device)
+            per_level_outputs.append(output)
+            entropies[level] = entropy
+            read_count += count
 
+        return per_level_outputs, entropies, read_count
+
+    def read_cold(
+        self,
+        step_state: HSSMState,
+    ) -> tuple[list[torch.Tensor], dict[int, float], int]:
+        device = step_state.master_state.device
+        per_level_outputs: list[torch.Tensor] = []
+        entropies: dict[int, float] = {}
+        read_count = 0
+
+        for level, _level_state in enumerate(step_state.level_states):
+            query = self.query_projections[level](step_state.master_state)
+            output, entropy, count = self._read_cold_level(level, query, device)
+            per_level_outputs.append(output)
+            entropies[level] = entropy
+            read_count += count
+
+        return per_level_outputs, entropies, read_count
+
+    def write_hot(self, step_state: HSSMState) -> None:
+        for level, level_state in enumerate(step_state.level_states):
             self._write_hot(level, level_state.detach(), step_state.step_index)
+
+    def consolidate(self, budget: float, timestamp: int) -> int:
+        maintenance_invocations = 0
+        for level in range(self.hssm_config.num_levels):
             if self._should_consolidate(level, budget):
-                self._consolidate(level, step_state.step_index)
+                self._consolidate(level, timestamp)
                 maintenance_invocations += 1
+        return maintenance_invocations
+
+    def read_write(self, step_state: HSSMState, budget: float) -> SemanticReadResult:
+        hot_outputs, hot_entropies, hot_reads = self.read_hot(step_state)
+        cold_outputs, cold_entropies, cold_reads = self.read_cold(step_state)
+        per_level_outputs = [
+            self.output_projections[level](hot_outputs[level] + cold_outputs[level])
+            for level in range(self.hssm_config.num_levels)
+        ]
+        entropies = {
+            level: hot_entropies.get(level, 0.0) + cold_entropies.get(level, 0.0)
+            for level in range(self.hssm_config.num_levels)
+        }
+        self.write_hot(step_state)
+        maintenance_invocations = self.consolidate(budget, step_state.step_index)
 
         return SemanticReadResult(
             per_level_outputs=per_level_outputs,
+            per_level_hot_outputs=hot_outputs,
+            per_level_cold_outputs=cold_outputs,
             entropies=entropies,
+            hot_entropies=hot_entropies,
+            cold_entropies=cold_entropies,
             maintenance_invocations=maintenance_invocations,
             hot_reads=hot_reads,
             cold_reads=cold_reads,
         )
 
-    def _read_hot(
+    def _read_hot_level(
         self,
         level: int,
         query: torch.Tensor,
@@ -88,7 +131,7 @@ class SemanticMemory(nn.Module):
         entropy = float((-weights * torch.log(weights.clamp_min(1e-8))).sum().item())
         return weights @ values, entropy, len(slots)
 
-    def _read_cold(
+    def _read_cold_level(
         self,
         level: int,
         query: torch.Tensor,

@@ -15,6 +15,7 @@ import yaml
 from torch import nn
 
 from htm_code_native.data.types import (
+    AlignedDocument,
     RepoGraphQueryContext,
     RepoGraphReadResult,
     RepositoryGraphEdge,
@@ -22,6 +23,7 @@ from htm_code_native.data.types import (
     RepositoryGraphNode,
 )
 from htm_code_native.data.vocabulary import VocabularySnapshot
+from htm_code_native.tokenizer.tree_sitter_backend import parse_source_document
 from htm_code_native.utils.hashing import stable_int_hash
 
 try:
@@ -263,102 +265,8 @@ class RepositoryGraphIndexer:
         relative_path: str,
     ) -> tuple[list[RepositoryGraphNode], list[RepositoryGraphEdge], list[_SymbolRecord]]:
         content = source_path.read_text(encoding="utf-8")
-        tree = ast.parse(content, filename=str(source_path))
-        nodes: list[RepositoryGraphNode] = []
-        edges: list[RepositoryGraphEdge] = []
-        symbols: list[_SymbolRecord] = []
-        literals = self._literal_terms_from_text(content)
-        import_counter = 0
-        file_node_id = self._file_node_id(relative_path)
-
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                kind = "class" if isinstance(node, ast.ClassDef) else "function"
-                symbol_node = self._make_symbol_node(
-                    kind=kind,
-                    relative_path=relative_path,
-                    name=node.name,
-                    line=int(getattr(node, "lineno", 0)),
-                    copy_terms=(node.name, *self._literal_terms_from_ast(node)),
-                )
-                nodes.append(symbol_node)
-                edges.append(
-                    RepositoryGraphEdge(
-                        source_id=file_node_id,
-                        target_id=symbol_node.node_id,
-                        kind="defines",
-                    )
-                )
-                symbols.append(
-                    _SymbolRecord(
-                        node_id=symbol_node.node_id,
-                        name=node.name,
-                        file_path=relative_path,
-                        kind=kind,
-                    )
-                )
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    import_counter += 1
-                    import_node = self._make_import_node(relative_path, alias.name, import_counter)
-                    nodes.append(import_node)
-                    edges.append(
-                        RepositoryGraphEdge(
-                            source_id=file_node_id,
-                            target_id=import_node.node_id,
-                            kind="imports",
-                        )
-                    )
-            elif isinstance(node, ast.ImportFrom):
-                module_name = "." * int(node.level) + (node.module or "")
-                import_counter += 1
-                import_node = self._make_import_node(relative_path, module_name, import_counter)
-                nodes.append(import_node)
-                edges.append(
-                    RepositoryGraphEdge(
-                        source_id=file_node_id,
-                        target_id=import_node.node_id,
-                        kind="imports",
-                    )
-                )
-
-        if self._is_test_file(relative_path, content):
-            test_name = source_path.stem
-            test_node = self._make_test_node(relative_path, test_name, tuple(literals))
-            nodes.append(test_node)
-            edges.append(
-                RepositoryGraphEdge(
-                    source_id=file_node_id,
-                    target_id=test_node.node_id,
-                    kind="contains",
-                )
-            )
-
-        call_records = self._python_call_records(tree, relative_path)
-        for source_node_id, callee_name in call_records:
-            call_node = self._make_reference_node(relative_path, source_node_id, callee_name)
-            nodes.append(call_node)
-            edges.append(
-                RepositoryGraphEdge(
-                    source_id=source_node_id,
-                    target_id=call_node.node_id,
-                    kind="references",
-                )
-            )
-
-        file_copy_terms = tuple(self._python_file_copy_terms(tree, literals))
-        if file_copy_terms:
-            nodes.append(
-                self._make_file_overlay_node(
-                    relative_path,
-                    "symbol",
-                    f"{source_path.stem}_symbols",
-                    file_copy_terms,
-                    heuristic=True,
-                )
-            )
-
-        return nodes, edges, symbols
+        document = parse_source_document(content, str(source_path), language="python")
+        return self._parse_code_document(relative_path, source_path.stem, document, heuristic=False)
 
     def _parse_ts_js_file(
         self,
@@ -367,156 +275,9 @@ class RepositoryGraphIndexer:
         relative_path: str,
     ) -> tuple[list[RepositoryGraphNode], list[RepositoryGraphEdge], list[_SymbolRecord]]:
         content = source_path.read_text(encoding="utf-8")
-        nodes: list[RepositoryGraphNode] = []
-        edges: list[RepositoryGraphEdge] = []
-        symbols: list[_SymbolRecord] = []
-        file_node_id = self._file_node_id(relative_path)
-        literals = self._literal_terms_from_text(content)
-        import_counter = 0
-
-        for import_spec in TS_IMPORT_RE.findall(content) + TS_REQUIRE_RE.findall(content):
-            import_counter += 1
-            import_node = self._make_import_node(relative_path, import_spec, import_counter, heuristic=True)
-            nodes.append(import_node)
-            edges.append(
-                RepositoryGraphEdge(
-                    source_id=file_node_id,
-                    target_id=import_node.node_id,
-                    kind="imports",
-                    heuristic=True,
-                )
-            )
-
-        for match in TS_FUNCTION_RE.finditer(content):
-            name = match.group(1)
-            symbol_node = self._make_symbol_node(
-                kind="function",
-                relative_path=relative_path,
-                name=name,
-                line=self._line_for_offset(content, match.start()),
-                copy_terms=(name, *literals),
-                heuristic=True,
-            )
-            nodes.append(symbol_node)
-            edges.append(
-                RepositoryGraphEdge(
-                    source_id=file_node_id,
-                    target_id=symbol_node.node_id,
-                    kind="defines",
-                    heuristic=True,
-                )
-            )
-            symbols.append(
-                _SymbolRecord(
-                    node_id=symbol_node.node_id,
-                    name=name,
-                    file_path=relative_path,
-                    kind="function",
-                )
-            )
-
-        for match in TS_CLASS_RE.finditer(content):
-            name = match.group(1)
-            symbol_node = self._make_symbol_node(
-                kind="class",
-                relative_path=relative_path,
-                name=name,
-                line=self._line_for_offset(content, match.start()),
-                copy_terms=(name, *literals),
-                heuristic=True,
-            )
-            nodes.append(symbol_node)
-            edges.append(
-                RepositoryGraphEdge(
-                    source_id=file_node_id,
-                    target_id=symbol_node.node_id,
-                    kind="defines",
-                    heuristic=True,
-                )
-            )
-            symbols.append(
-                _SymbolRecord(
-                    node_id=symbol_node.node_id,
-                    name=name,
-                    file_path=relative_path,
-                    kind="class",
-                )
-            )
-
-        for match in TS_ARROW_RE.finditer(content):
-            name = match.group(1)
-            symbol_node = self._make_symbol_node(
-                kind="function",
-                relative_path=relative_path,
-                name=name,
-                line=self._line_for_offset(content, match.start()),
-                copy_terms=(name, *literals),
-                heuristic=True,
-            )
-            nodes.append(symbol_node)
-            edges.append(
-                RepositoryGraphEdge(
-                    source_id=file_node_id,
-                    target_id=symbol_node.node_id,
-                    kind="defines",
-                    heuristic=True,
-                )
-            )
-            symbols.append(
-                _SymbolRecord(
-                    node_id=symbol_node.node_id,
-                    name=name,
-                    file_path=relative_path,
-                    kind="function",
-                )
-            )
-
-        if self._is_test_file(relative_path, content):
-            test_node = self._make_test_node(relative_path, source_path.stem, tuple(literals), heuristic=True)
-            nodes.append(test_node)
-            edges.append(
-                RepositoryGraphEdge(
-                    source_id=file_node_id,
-                    target_id=test_node.node_id,
-                    kind="contains",
-                    heuristic=True,
-                )
-            )
-
-        call_terms = [
-            name
-            for name in TS_CALL_RE.findall(content)
-            if name not in JS_CALL_KEYWORDS
-        ]
-        for index, callee_name in enumerate(call_terms, start=1):
-            call_node = self._make_reference_node(
-                relative_path,
-                f"ts-call:{relative_path}:{index}",
-                callee_name,
-                heuristic=True,
-            )
-            nodes.append(call_node)
-            edges.append(
-                RepositoryGraphEdge(
-                    source_id=file_node_id,
-                    target_id=call_node.node_id,
-                    kind="references",
-                    heuristic=True,
-                )
-            )
-
-        if literals:
-            nodes.append(
-                self._make_file_overlay_node(
-                    relative_path,
-                    "symbol",
-                    f"{source_path.stem}_literals",
-                    tuple(literals),
-                    heuristic=True,
-                )
-            )
-
-        return nodes, edges, symbols
+        language = "typescript" if source_path.suffix.lower() in {".ts", ".tsx"} else "javascript"
+        document = parse_source_document(content, str(source_path), language=language)
+        return self._parse_code_document(relative_path, source_path.stem, document, heuristic=True)
 
     def _parse_config_file(
         self,
@@ -524,7 +285,9 @@ class RepositoryGraphIndexer:
         source_path: Path,
         relative_path: str,
     ) -> tuple[list[RepositoryGraphNode], list[RepositoryGraphEdge], list[_SymbolRecord]]:
-        config_terms = self._config_terms(source_path)
+        content = source_path.read_text(encoding="utf-8")
+        document = parse_source_document(content, str(source_path))
+        config_terms = self._config_terms_from_document(source_path, document)
         config_node = self._make_config_node(relative_path, source_path.stem, tuple(config_terms))
         return [
             config_node
@@ -535,6 +298,215 @@ class RepositoryGraphIndexer:
                 kind="contains",
             )
         ], []
+
+    def _parse_code_document(
+        self,
+        relative_path: str,
+        stem: str,
+        document: AlignedDocument,
+        heuristic: bool,
+    ) -> tuple[list[RepositoryGraphNode], list[RepositoryGraphEdge], list[_SymbolRecord]]:
+        nodes: list[RepositoryGraphNode] = []
+        edges: list[RepositoryGraphEdge] = []
+        symbols: list[_SymbolRecord] = []
+        file_node_id = self._file_node_id(relative_path)
+        literals = self._literal_terms_from_text(document.source_text)
+
+        for symbol in document.symbols:
+            line = self._line_for_byte_offset(document, symbol.start_byte)
+            kind = symbol.kind if symbol.kind in {"function", "class"} else "symbol"
+            symbol_node = self._make_symbol_node(
+                kind=kind,
+                relative_path=relative_path,
+                name=symbol.name,
+                line=line,
+                copy_terms=self._symbol_copy_terms(document, symbol),
+                heuristic=heuristic,
+            )
+            nodes.append(symbol_node)
+            edges.append(
+                RepositoryGraphEdge(
+                    source_id=file_node_id,
+                    target_id=symbol_node.node_id,
+                    kind="defines",
+                    heuristic=heuristic,
+                )
+            )
+            symbols.append(
+                _SymbolRecord(
+                    node_id=symbol_node.node_id,
+                    name=symbol.name,
+                    file_path=relative_path,
+                    kind=kind,
+                )
+            )
+
+        import_specs = self._import_specs_from_document(document)
+        for index, import_spec in enumerate(import_specs, start=1):
+            import_node = self._make_import_node(relative_path, import_spec, index, heuristic=heuristic)
+            nodes.append(import_node)
+            edges.append(
+                RepositoryGraphEdge(
+                    source_id=file_node_id,
+                    target_id=import_node.node_id,
+                    kind="imports",
+                    heuristic=heuristic,
+                )
+            )
+
+        if self._is_test_file(relative_path, document.source_text):
+            test_node = self._make_test_node(relative_path, stem, tuple(literals), heuristic=heuristic)
+            nodes.append(test_node)
+            edges.append(
+                RepositoryGraphEdge(
+                    source_id=file_node_id,
+                    target_id=test_node.node_id,
+                    kind="contains",
+                    heuristic=heuristic,
+                )
+            )
+
+        call_records = self._call_records_from_document(document, relative_path)
+        for source_node_id, callee_name in call_records:
+            call_node = self._make_reference_node(
+                relative_path,
+                source_node_id,
+                callee_name,
+                heuristic=heuristic,
+            )
+            nodes.append(call_node)
+            edges.append(
+                RepositoryGraphEdge(
+                    source_id=source_node_id,
+                    target_id=call_node.node_id,
+                    kind="references",
+                    heuristic=heuristic,
+                )
+            )
+
+        file_copy_terms = tuple(self._code_copy_terms_from_document(document, literals))
+        if file_copy_terms:
+            nodes.append(
+                self._make_file_overlay_node(
+                    relative_path,
+                    "symbol",
+                    f"{stem}_symbols",
+                    file_copy_terms,
+                    heuristic=heuristic,
+                )
+            )
+
+        return nodes, edges, symbols
+
+    def _import_specs_from_document(self, document: AlignedDocument) -> list[str]:
+        specs: list[str] = []
+        if document.parse_document is None:
+            return specs
+        import_node_types = {"import_statement", "import_from_statement"}
+        for node in document.parse_document.nodes:
+            if node.node_type not in import_node_types:
+                continue
+            span_text = document.source_text.encode("utf-8")[node.start_byte : node.end_byte].decode(
+                "utf-8",
+                errors="ignore",
+            )
+            spec = self._extract_import_spec(span_text, document.language)
+            if spec:
+                specs.append(spec)
+        return self._unique_terms(specs)
+
+    def _call_records_from_document(
+        self,
+        document: AlignedDocument,
+        relative_path: str,
+    ) -> list[tuple[str, str]]:
+        records: list[tuple[str, str]] = []
+        if document.parse_document is None:
+            return records
+        current_scope = self._file_node_id(relative_path)
+        for node in document.parse_document.nodes:
+            if node.node_type not in {"call", "call_expression"}:
+                continue
+            span_text = document.source_text.encode("utf-8")[node.start_byte : node.end_byte].decode(
+                "utf-8",
+                errors="ignore",
+            )
+            callee_name = self._extract_call_name(span_text)
+            if not callee_name or callee_name in JS_CALL_KEYWORDS:
+                continue
+            source_node_id = current_scope
+            for info in document.token_structures:
+                token = document.tokens[info.token_index]
+                if token.start_byte >= node.start_byte and token.end_byte <= node.end_byte and info.symbol_id:
+                    source_node_id = info.symbol_id
+                    break
+            records.append((source_node_id, callee_name))
+        return records
+
+    def _config_terms_from_document(self, source_path: Path, document: AlignedDocument) -> list[str]:
+        terms: list[str] = [source_path.stem]
+        for token in document.tokens:
+            if token.token_class.value in {"identifier", "string", "number"}:
+                terms.append(token.value.strip("\"'"))
+        if len(terms) <= 1:
+            terms.extend(self._config_terms(source_path))
+        return self._unique_terms(terms)
+
+    def _symbol_copy_terms(self, document: AlignedDocument, symbol) -> tuple[str, ...]:
+        terms: list[str] = [symbol.name]
+        for token in document.tokens:
+            if token.start_byte < symbol.start_byte or token.end_byte > symbol.end_byte:
+                continue
+            if token.token_class.value in {"identifier", "string", "number"}:
+                terms.append(token.value.strip("\"'"))
+        return tuple(self._unique_terms(terms))
+
+    def _code_copy_terms_from_document(
+        self,
+        document: AlignedDocument,
+        literals: Sequence[str],
+    ) -> list[str]:
+        terms: list[str] = []
+        for token in document.tokens:
+            if token.token_class.value in {"identifier", "string", "number"}:
+                terms.append(token.value.strip("\"'"))
+        terms.extend(literals)
+        return self._unique_terms(terms)
+
+    def _extract_import_spec(self, span_text: str, language: str) -> str | None:
+        stripped = span_text.strip()
+        if language == "python":
+            match = re.search(r"from\s+([A-Za-z0-9_\.]+)\s+import", stripped)
+            if match:
+                return match.group(1)
+            match = re.search(r"import\s+([A-Za-z0-9_\.]+)", stripped)
+            if match:
+                return match.group(1)
+            return None
+        match = re.search(r"""from\s+["'](.+?)["']""", stripped)
+        if match:
+            return match.group(1)
+        match = re.search(r"""require\(\s*["'](.+?)["']\s*\)""", stripped)
+        if match:
+            return match.group(1)
+        return None
+
+    def _extract_call_name(self, span_text: str) -> str | None:
+        prefix = span_text.split("(", 1)[0].strip()
+        if not prefix:
+            return None
+        if "." in prefix:
+            prefix = prefix.split(".")[-1]
+        prefix = prefix.split()[-1]
+        return prefix or None
+
+    def _line_for_byte_offset(self, document: AlignedDocument, byte_offset: int) -> int:
+        for token in document.tokens:
+            if token.start_byte <= byte_offset <= token.end_byte:
+                return token.line
+        if document.tokens:
+            return document.tokens[-1].line
+        return 1
 
     def _import_specs_from_nodes(self, nodes: Sequence[RepositoryGraphNode]) -> list[str]:
         specs: list[str] = []
@@ -673,7 +645,9 @@ class RepositoryGraphIndexer:
         tree = ElementTree.parse(path)
         counter = 0
         for testcase in tree.findall(".//testcase"):
-            failure = testcase.find("failure") or testcase.find("error")
+            failure = testcase.find("failure")
+            if failure is None:
+                failure = testcase.find("error")
             if failure is None:
                 continue
             counter += 1
@@ -857,7 +831,7 @@ class RepositoryGraphIndexer:
     def _resolve_report_target(self, root: Path, raw_value: str) -> str | None:
         if not raw_value:
             return None
-        normalized = raw_value.replace(".", "/")
+        normalized = raw_value if "/" in raw_value or "\\" in raw_value else raw_value.replace(".", "/")
         candidate = self._resolve_path_to_relative(root, normalized)
         if candidate is not None:
             return candidate
@@ -1149,10 +1123,12 @@ class RepositoryGraphMemory(nn.Module):
         symbol_bias: float,
         test_bias: float,
         diagnostic_bias: float,
+        value_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.key_dim = key_dim
+        self.value_dim = value_dim or hidden_size
         self.vocab_size = vocab_size
         self.top_k = top_k
         self.graph_copy_weight = graph_copy_weight
@@ -1161,12 +1137,60 @@ class RepositoryGraphMemory(nn.Module):
         self.symbol_bias = symbol_bias
         self.test_bias = test_bias
         self.diagnostic_bias = diagnostic_bias
+        self.term_vocab_size = 2048
+        self.kind_to_id = {
+            "file": 0,
+            "symbol": 1,
+            "function": 2,
+            "class": 3,
+            "import": 4,
+            "test": 5,
+            "diagnostic": 6,
+            "config": 7,
+        }
+        self.edge_kind_to_id = {
+            "contains": 0,
+            "defines": 1,
+            "imports": 2,
+            "calls": 3,
+            "references": 4,
+            "tested_by": 5,
+            "fails_with": 6,
+        }
+        self.flag_to_id = {
+            "heuristic": 0,
+            "samefile": 1,
+            "symbol_name": 2,
+            "import_spec": 3,
+            "report_path": 4,
+            "test": 5,
+            "diagnostic": 6,
+        }
+        self.term_embedding = nn.Embedding(self.term_vocab_size, key_dim)
+        self.kind_embedding = nn.Embedding(len(self.kind_to_id), key_dim)
+        self.edge_kind_embedding = nn.Embedding(len(self.edge_kind_to_id), key_dim)
+        self.flag_embedding = nn.Embedding(len(self.flag_to_id), key_dim)
+        self.node_feature_norm = nn.LayerNorm(key_dim)
+        self.node_key_projection = nn.Linear(key_dim, key_dim)
+        self.node_value_projection = nn.Linear(key_dim, self.value_dim)
+        self.context_projection = nn.Linear(key_dim, key_dim)
         self.query_projection = nn.Linear(hidden_size + key_dim, key_dim)
-        self.prior_head = nn.Linear(hidden_size, vocab_size)
+        self.prior_head = nn.Linear(self.value_dim, vocab_size)
         self.index: RepositoryGraphIndex | None = None
+        self.node_edge_kinds: dict[str, tuple[str, ...]] = {}
 
     def set_index(self, index: RepositoryGraphIndex | None) -> None:
         self.index = index
+        if index is None:
+            self.node_edge_kinds = {}
+            return
+        edge_kinds: dict[str, list[str]] = {}
+        for edge in index.edges:
+            edge_kinds.setdefault(edge.source_id, []).append(edge.kind)
+            edge_kinds.setdefault(edge.target_id, []).append(edge.kind)
+        self.node_edge_kinds = {
+            node_id: tuple(kinds) for node_id, kinds in edge_kinds.items()
+        }
 
     def reset(self) -> None:
         return None
@@ -1182,7 +1206,7 @@ class RepositoryGraphMemory(nn.Module):
         log_distribution = torch.full((self.vocab_size,), fill_value=math.log(1e-8), device=device)
         attention = torch.zeros(self.top_k, device=device)
         copy_token_ids = torch.full((self.vocab_size,), fill_value=-1, dtype=torch.long, device=device)
-        graph_context = torch.zeros(self.hidden_size, device=device)
+        graph_context = torch.zeros(self.value_dim, device=device)
 
         if self.index is None or not self.index.nodes:
             return RepoGraphReadResult(
@@ -1191,6 +1215,7 @@ class RepositoryGraphMemory(nn.Module):
                 log_distribution=log_distribution,
                 attention=attention,
                 copy_token_ids=copy_token_ids[:0],
+                candidate_scores=torch.zeros(0, device=device),
                 candidate_node_ids=(),
                 candidate_kinds=(),
                 candidate_names=(),
@@ -1203,18 +1228,20 @@ class RepositoryGraphMemory(nn.Module):
                 symbol_hits=0,
                 test_hits=0,
                 diagnostic_hits=0,
+                target_node_id=None,
             )
 
         context_features = self._encode_context(context, device)
         query = self.query_projection(torch.cat([hidden, context_features], dim=-1))
-        scored: list[tuple[float, RepositoryGraphNode, dict[str, bool]]] = []
+        scored: list[tuple[float, torch.Tensor, RepositoryGraphNode, dict[str, bool], torch.Tensor]] = []
         import_closure = set(self.index.import_closure_by_file.get(context.file_path, ()))
         test_files = set(self.index.test_files_by_source.get(context.file_path, ()))
         diagnostic_files = set(self.index.diagnostic_files_by_source.get(context.file_path, ()))
 
         for node in self.index.nodes:
-            key = node.key.to(device)
-            score = float((query @ key).item() / math.sqrt(self.key_dim))
+            key, value = self._encode_node(node, device)
+            score_tensor = (query @ key) / math.sqrt(self.key_dim)
+            score = float(score_tensor.detach().item())
             flags = {
                 "samefile": node.file_path == context.file_path,
                 "import": node.file_path in import_closure if node.file_path is not None else False,
@@ -1232,7 +1259,7 @@ class RepositoryGraphMemory(nn.Module):
                 score += self.test_bias
             if flags["diagnostic"]:
                 score += self.diagnostic_bias
-            scored.append((score, node, flags))
+            scored.append((score, score_tensor + self._bias_tensor(flags, device), node, flags, value))
 
         scored.sort(key=lambda item: item[0], reverse=True)
         selected = scored[: self.top_k]
@@ -1243,6 +1270,7 @@ class RepositoryGraphMemory(nn.Module):
                 log_distribution=log_distribution,
                 attention=attention,
                 copy_token_ids=copy_token_ids[:0],
+                candidate_scores=torch.zeros(0, device=device),
                 candidate_node_ids=(),
                 candidate_kinds=(),
                 candidate_names=(),
@@ -1255,28 +1283,38 @@ class RepositoryGraphMemory(nn.Module):
                 symbol_hits=0,
                 test_hits=0,
                 diagnostic_hits=0,
+                target_node_id=None,
             )
 
-        score_tensor = torch.tensor([item[0] for item in selected], dtype=torch.float32, device=device)
+        score_tensor = torch.stack([item[1] for item in selected], dim=0)
         weights = torch.softmax(score_tensor, dim=0)
         attention[: len(selected)] = weights
-        candidate_node_ids = tuple(item[1].node_id for item in selected)
-        candidate_kinds = tuple(item[1].kind for item in selected)
-        candidate_names = tuple(item[1].name for item in selected)
-        samefile_hits = sum(1 for _, _, flags in selected if flags["samefile"])
-        import_hits = sum(1 for _, _, flags in selected if flags["import"])
-        symbol_hits = sum(1 for _, _, flags in selected if flags["symbol"])
-        test_hits = sum(1 for _, _, flags in selected if flags["test"])
-        diagnostic_hits = sum(1 for _, _, flags in selected if flags["diagnostic"])
+        candidate_node_ids = tuple(item[2].node_id for item in selected)
+        candidate_kinds = tuple(item[2].kind for item in selected)
+        candidate_names = tuple(item[2].name for item in selected)
+        samefile_hits = sum(1 for _, _, _, flags, _ in selected if flags["samefile"])
+        import_hits = sum(1 for _, _, _, flags, _ in selected if flags["import"])
+        symbol_hits = sum(1 for _, _, _, flags, _ in selected if flags["symbol"])
+        test_hits = sum(1 for _, _, _, flags, _ in selected if flags["test"])
+        diagnostic_hits = sum(1 for _, _, _, flags, _ in selected if flags["diagnostic"])
+        target_node_id = None
+        for _score, _score_tensor, node, flags, _value in selected:
+            symbol_name = str(node.metadata.get("symbol_name", ""))
+            if symbol_name and context.current_symbol_name and symbol_name == context.current_symbol_name:
+                target_node_id = node.node_id
+                break
+            if context.token_value and context.token_value in node.copy_terms:
+                target_node_id = node.node_id
+                break
 
-        context_vectors = torch.stack([item[1].value.to(device) for item in selected], dim=0)
+        context_vectors = torch.stack([item[4] for item in selected], dim=0)
         graph_context = torch.sum(weights.unsqueeze(-1) * context_vectors, dim=0)
         prior_logits = self.prior_head(graph_context)
         prior_distribution = torch.softmax(prior_logits, dim=-1)
 
         copy_distribution = torch.zeros(self.vocab_size, device=device)
         supported_token_ids: list[int] = []
-        for weight, (_, node, _) in zip(weights, selected, strict=False):
+        for weight, (_, _, node, _, _) in zip(weights, selected, strict=False):
             supported_ids = [
                 token_id
                 for token_id in (
@@ -1313,6 +1351,7 @@ class RepositoryGraphMemory(nn.Module):
             log_distribution=log_distribution,
             attention=attention,
             copy_token_ids=copy_token_ids,
+            candidate_scores=score_tensor,
             candidate_node_ids=candidate_node_ids,
             candidate_kinds=candidate_kinds,
             candidate_names=candidate_names,
@@ -1325,6 +1364,7 @@ class RepositoryGraphMemory(nn.Module):
             symbol_hits=symbol_hits,
             test_hits=test_hits,
             diagnostic_hits=diagnostic_hits,
+            target_node_id=target_node_id,
         )
 
     def _encode_context(self, context: RepoGraphQueryContext, device: torch.device) -> torch.Tensor:
@@ -1335,18 +1375,80 @@ class RepositoryGraphMemory(nn.Module):
             context.token_value,
             context.token_class,
         ]
-        vector = torch.zeros(self.key_dim, device=device)
-        for term in terms:
-            text = str(term).strip()
-            if not text:
-                continue
-            index = stable_int_hash(text, self.key_dim)
-            sign = -1.0 if stable_int_hash(f"sign:{text}", 2) == 0 else 1.0
-            vector[index] += sign
-        norm = vector.norm(p=2)
-        if norm.item() > 0:
-            vector = vector / norm
-        return vector
+        embedded = self._embed_terms(terms, device)
+        return self.context_projection(embedded)
+
+    def _bias_tensor(self, flags: dict[str, bool], device: torch.device) -> torch.Tensor:
+        value = 0.0
+        if flags["samefile"]:
+            value += self.samefile_bias
+        if flags["import"]:
+            value += self.import_bias
+        if flags["symbol"]:
+            value += self.symbol_bias
+        if flags["test"]:
+            value += self.test_bias
+        if flags["diagnostic"]:
+            value += self.diagnostic_bias
+        return torch.tensor(value, dtype=torch.float32, device=device)
+
+    def _encode_node(self, node: RepositoryGraphNode, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        term_features = node.key.to(device)
+        kind_id = self.kind_to_id.get(node.kind, self.kind_to_id["symbol"])
+        kind_features = self.kind_embedding(
+            torch.tensor(kind_id, dtype=torch.long, device=device)
+        )
+        edge_features = self._embed_edge_kinds(self.node_edge_kinds.get(node.node_id, ()), device)
+        flags = []
+        if node.heuristic:
+            flags.append("heuristic")
+        if node.kind == "test":
+            flags.append("test")
+        if node.kind == "diagnostic":
+            flags.append("diagnostic")
+        if "symbol_name" in node.metadata:
+            flags.append("symbol_name")
+        if "import_spec" in node.metadata:
+            flags.append("import_spec")
+        if "report_path" in node.metadata:
+            flags.append("report_path")
+        flag_features = self._embed_flags(flags, device)
+        feature = self.node_feature_norm(term_features + kind_features + edge_features + flag_features)
+        value_input = node.value.to(device) + feature
+        return self.node_key_projection(feature), self.node_value_projection(value_input)
+
+    def _embed_terms(self, terms: Sequence[str], device: torch.device) -> torch.Tensor:
+        indices = [
+            stable_int_hash(text, self.term_vocab_size)
+            for text in (str(term).strip() for term in terms)
+            if text
+        ]
+        if not indices:
+            return torch.zeros(self.key_dim, device=device)
+        tensor = torch.tensor(indices, dtype=torch.long, device=device)
+        return self.term_embedding(tensor).mean(dim=0)
+
+    def _embed_edge_kinds(self, edge_kinds: Sequence[str], device: torch.device) -> torch.Tensor:
+        indices = [
+            self.edge_kind_to_id[kind]
+            for kind in edge_kinds
+            if kind in self.edge_kind_to_id
+        ]
+        if not indices:
+            return torch.zeros(self.key_dim, device=device)
+        tensor = torch.tensor(indices, dtype=torch.long, device=device)
+        return self.edge_kind_embedding(tensor).mean(dim=0)
+
+    def _embed_flags(self, flags: Sequence[str], device: torch.device) -> torch.Tensor:
+        indices = [
+            self.flag_to_id[flag]
+            for flag in flags
+            if flag in self.flag_to_id
+        ]
+        if not indices:
+            return torch.zeros(self.key_dim, device=device)
+        tensor = torch.tensor(indices, dtype=torch.long, device=device)
+        return self.flag_embedding(tensor).mean(dim=0)
 
     def _in_symbol_closure(self, node: RepositoryGraphNode, context: RepoGraphQueryContext) -> bool:
         if context.current_symbol_name is None:
@@ -1389,6 +1491,7 @@ class NoOpRepoGraph:
             log_distribution=torch.zeros(1, device=device),
             attention=torch.zeros(1, device=device),
             copy_token_ids=torch.full((0,), fill_value=-1, dtype=torch.long, device=device),
+            candidate_scores=torch.zeros(0, device=device),
             candidate_node_ids=(),
             candidate_kinds=(),
             candidate_names=(),
@@ -1401,4 +1504,5 @@ class NoOpRepoGraph:
             symbol_hits=0,
             test_hits=0,
             diagnostic_hits=0,
+            target_node_id=None,
         )

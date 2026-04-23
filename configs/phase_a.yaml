@@ -30,6 +30,36 @@ model:
   graph_test_bias: 1.0
   graph_diagnostic_bias: 1.0
   repo_max_files: 256
+  parser_backend: tree-sitter
+  supported_languages:
+    - python
+    - javascript
+    - typescript
+    - json
+    - yaml
+    - toml
+    - ini
+  max_parse_errors: 32
+  graph_value_dim: 128
+  graph_out_blend: 1.0
+  symbol_link_weight: 0.1
+  pre_router_hidden_dim: 128
+  post_router_hidden_dim: 128
+  route_temperature: 1.0
+  route_top_k: 2
+  route_threshold_cold_semantic: 0.35
+  route_threshold_eem: 0.35
+  route_threshold_graph: 0.35
+  route_weight: 0.1
+  energy_weight: 0.01
+  route_consistency_weight: 0.02
+  lane_cost_lm: 1.0
+  lane_cost_semantic_hot: 1.0
+  lane_cost_erm: 1.0
+  lane_cost_semantic_cold: 2.0
+  lane_cost_eem: 2.5
+  lane_cost_graph: 2.5
+  maintenance_cost: 0.5
 hssm:
   max_level: 5
   hidden_size: 128

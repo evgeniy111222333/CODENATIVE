@@ -124,6 +124,12 @@ def main() -> int:
     graph_symbol_recall = 0.0
     graph_test_recall = 0.0
     graph_diagnostic_recall = 0.0
+    route_entropy = 0.0
+    energy_proxy = 0.0
+    skipped_expensive = 0.0
+    graph_invocation_rate = 0.0
+    eem_invocation_rate = 0.0
+    cold_semantic_invocation_rate = 0.0
     for _ in range(iterations):
         with torch.no_grad():
             output = model(batch)
@@ -162,6 +168,12 @@ def main() -> int:
             batch,
             required_kinds={"diagnostic"},
         )
+        route_entropy += float(output.diagnostics["route_entropy"])
+        energy_proxy += float(output.memory_stats["avg_energy_proxy"])
+        skipped_expensive += float(output.memory_stats["avg_skipped_expensive_reads"])
+        graph_invocation_rate += float(output.memory_stats["graph_invocations"]) / max(len(batch.document.tokens), 1)
+        eem_invocation_rate += float(output.memory_stats["eem_invocations"]) / max(len(batch.document.tokens), 1)
+        cold_semantic_invocation_rate += float(output.memory_stats["cold_semantic_invocations"]) / max(len(batch.document.tokens), 1)
     elapsed = time.perf_counter() - start
     tokens = len(batch.document.tokens) * iterations
 
@@ -191,6 +203,15 @@ def main() -> int:
             "graph_symbol_recall": graph_symbol_recall / iterations,
             "graph_test_recall": graph_test_recall / iterations,
             "graph_diagnostic_recall": graph_diagnostic_recall / iterations,
+            "avg_route_entropy": route_entropy / iterations,
+            "avg_energy_proxy": energy_proxy / iterations,
+            "avg_skipped_expensive_reads": skipped_expensive / iterations,
+            "graph_invocation_rate": graph_invocation_rate / iterations,
+            "eem_invocation_rate": eem_invocation_rate / iterations,
+            "cold_semantic_invocation_rate": cold_semantic_invocation_rate / iterations,
+            "always_on_vs_hard_gated_delta": (
+                output.memory_stats["always_on_energy"] - output.memory_stats["avg_energy_proxy"]
+            ),
         }
     )
     return 0

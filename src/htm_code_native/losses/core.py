@@ -68,3 +68,65 @@ def graph_copy_loss(
         device = targets.device if isinstance(targets, torch.Tensor) else None
         return torch.tensor(0.0, device=device)
     return F.nll_loss(graph_logits[graph_copy_target_mask], targets[graph_copy_target_mask])
+
+
+def symbol_link_loss(
+    candidate_scores: list[torch.Tensor],
+    candidate_node_ids: list[tuple[str, ...]],
+    target_node_ids: list[str | None],
+) -> torch.Tensor:
+    losses: list[torch.Tensor] = []
+    for scores, node_ids, target_node_id in zip(candidate_scores, candidate_node_ids, target_node_ids, strict=False):
+        if target_node_id is None or scores.numel() == 0 or target_node_id not in node_ids:
+            continue
+        target_index = node_ids.index(target_node_id)
+        losses.append(
+            F.cross_entropy(
+                scores.unsqueeze(0),
+                torch.tensor([target_index], dtype=torch.long, device=scores.device),
+            )
+        )
+    if not losses:
+        device = candidate_scores[0].device if candidate_scores else None
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
+def routing_loss(
+    router_post_logits: list[torch.Tensor],
+    teacher_indices: list[int],
+) -> torch.Tensor:
+    losses: list[torch.Tensor] = []
+    for logits, teacher_index in zip(router_post_logits, teacher_indices, strict=False):
+        losses.append(
+            F.cross_entropy(
+                logits.unsqueeze(0),
+                torch.tensor([teacher_index], dtype=torch.long, device=logits.device),
+            )
+        )
+    if not losses:
+        device = router_post_logits[0].device if router_post_logits else None
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
+def route_consistency_loss(
+    router_pre_logits: list[torch.Tensor],
+    teacher_expensive: list[tuple[int, int, int]],
+) -> torch.Tensor:
+    losses: list[torch.Tensor] = []
+    for logits, teacher in zip(router_pre_logits, teacher_expensive, strict=False):
+        target = torch.tensor(teacher, dtype=torch.float32, device=logits.device)
+        losses.append(F.binary_cross_entropy_with_logits(logits, target))
+    if not losses:
+        device = router_pre_logits[0].device if router_pre_logits else None
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
+def energy_penalty(energy_proxy: torch.Tensor | None, always_on_energy: float) -> torch.Tensor:
+    if energy_proxy is None or energy_proxy.numel() == 0:
+        device = energy_proxy.device if isinstance(energy_proxy, torch.Tensor) else None
+        return torch.tensor(0.0, device=device)
+    baseline = energy_proxy.new_tensor(always_on_energy)
+    return torch.relu(energy_proxy - baseline).mean()

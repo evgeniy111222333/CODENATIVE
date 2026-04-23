@@ -11,17 +11,20 @@ from htm_code_native.data.featurizer import build_batch_from_document
 from htm_code_native.data.vocabulary import VocabularyRegistry
 from htm_code_native.losses.core import (
     autoregressive_loss,
+    energy_penalty,
     episodic_pointer_loss,
     graph_copy_loss,
     hierarchical_consistency_loss,
     recent_copy_loss,
+    route_consistency_loss,
+    routing_loss,
     sparse_retrieval_entropy_loss,
+    symbol_link_loss,
 )
 from htm_code_native.memory.repo_graph import RepositoryGraphIndexer
 from htm_code_native.model.phase_a import PhaseACodeModel
 from htm_code_native.tokenizer.boundary import BoundaryScheduler
-from htm_code_native.tokenizer.python_tokenizer import PythonTokenizer
-from htm_code_native.tokenizer.structure import PythonStructureExtractor
+from htm_code_native.tokenizer.tree_sitter_backend import detect_language, parse_source_document
 
 
 def load_config(config_path: str | None) -> HTMCodeNativeConfig:
@@ -65,7 +68,7 @@ def build_repo_graph_index(
     effective_reports = report_paths if report_paths else default_report_paths(resolved_root)
     indexer = RepositoryGraphIndexer(
         key_dim=config.model.graph_key_dim,
-        value_dim=config.model.model_dim,
+        value_dim=config.model.graph_value_dim,
         max_files=config.model.repo_max_files,
     )
     return indexer.build(resolved_root, report_paths=effective_reports)
@@ -77,10 +80,8 @@ def build_batch(
     registry: VocabularyRegistry | None = None,
 ):
     source = Path(file_path).read_text(encoding="utf-8")
-    tokenizer = PythonTokenizer()
-    structure = PythonStructureExtractor()
     scheduler = BoundaryScheduler(max_level=config.hssm.max_level)
-    document = structure.enrich(tokenizer.encode(source, file_path))
+    document = parse_source_document(source, file_path, language=detect_language(file_path))
     boundaries = scheduler.build(document)
     batch = build_batch_from_document(document, boundaries, config, registry=registry)
     return document, boundaries, batch
@@ -127,6 +128,8 @@ def command_inspect(args: argparse.Namespace) -> int:
     )
     payload = {
         "summary": document.to_summary(),
+        "parser_backend": document.parse_document.parser_backend if document.parse_document else None,
+        "parse_errors": list(document.parse_document.error_messages) if document.parse_document else [],
         "symbols": [
             {
                 "symbol_id": symbol.symbol_id,
@@ -177,6 +180,11 @@ def command_run_forward(args: argparse.Namespace) -> int:
         "registry_size": batch.registry_size,
         "diagnostics": output.diagnostics,
         "memory_stats": output.memory_stats,
+        "router_last_weights": [float(value) for value in output.router_weights[-1].tolist()],
+        "router_last_pre_mask": [bool(value) for value in output.router_pre_mask[-1].tolist()],
+        "router_last_post_mask": [bool(value) for value in output.router_post_mask[-1].tolist()],
+        "router_last_lane_entropies": [float(value) for value in output.lane_entropies[-1].tolist()],
+        "energy_proxy_mean": float(output.energy_proxy.mean().item()),
         "last_step_top_ids": top_indices.tolist(),
         "last_step_top_scores": [float(value) for value in top_values.tolist()],
         "last_step_top_copy_ids": copy_indices.tolist(),
@@ -188,6 +196,7 @@ def command_run_forward(args: argparse.Namespace) -> int:
         "last_graph_candidate_ids": list(output.auxiliary["graph_candidate_ids"][-1]),
         "last_graph_candidate_kinds": list(output.auxiliary["graph_candidate_kinds"][-1]),
         "last_graph_candidate_names": list(output.auxiliary["graph_candidate_names"][-1]),
+        "graph_fusion_norm": float(output.graph_contexts[-1].norm().item()),
         "graph_summary": graph_index.to_summary(),
     }
     print(json.dumps(payload, indent=2))
@@ -240,6 +249,23 @@ def command_smoke_train(args: argparse.Namespace) -> int:
             batch.targets,
             output.graph_copy_target_mask,
         )
+        sym_loss = symbol_link_loss(
+            output.auxiliary["graph_candidate_scores"],
+            output.auxiliary["graph_candidate_ids"],
+            output.auxiliary["graph_target_node_ids"],
+        )
+        route_loss = routing_loss(
+            output.auxiliary["router_post_logits"],
+            output.auxiliary["route_teacher_indices"],
+        )
+        consistency_loss = route_consistency_loss(
+            output.auxiliary["router_pre_logits"],
+            output.auxiliary["route_teacher_expensive"],
+        )
+        energy_loss = energy_penalty(
+            output.energy_proxy,
+            output.memory_stats["always_on_energy"],
+        )
         total_loss = (
             ar_loss
             + 0.2 * hier_loss
@@ -247,6 +273,10 @@ def command_smoke_train(args: argparse.Namespace) -> int:
             + config.model.copy_recent_weight * copy_r_loss
             + config.model.copy_episodic_weight * ptr_loss
             + config.model.graph_blend * graph_loss
+            + config.model.symbol_link_weight * sym_loss
+            + config.model.route_weight * route_loss
+            + config.model.route_consistency_weight * consistency_loss
+            + config.model.energy_weight * energy_loss
         )
         total_loss.backward()
         optimizer.step()
@@ -262,10 +292,16 @@ def command_smoke_train(args: argparse.Namespace) -> int:
                     "copy_r_loss": float(copy_r_loss.item()),
                     "ptr_loss": float(ptr_loss.item()),
                     "graph_loss": float(graph_loss.item()),
+                    "sym_loss": float(sym_loss.item()),
+                    "route_loss": float(route_loss.item()),
+                    "route_consistency_loss": float(consistency_loss.item()),
+                    "energy_loss": float(energy_loss.item()),
                     "copy_target_hits": float(output.memory_stats["copy_target_hits"]),
                     "episodic_target_hits": float(output.memory_stats["episodic_target_hits"]),
                     "graph_copy_hits": float(output.memory_stats["graph_copy_hits"]),
                     "graph_reads": float(output.memory_stats["graph_reads"]),
+                    "symbol_link_hits": float(output.memory_stats["symbol_link_hits"]),
+                    "avg_energy_proxy": float(output.memory_stats["avg_energy_proxy"]),
                     "registry_size": batch.registry_size,
                 }
             )

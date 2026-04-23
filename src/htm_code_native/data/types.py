@@ -67,6 +67,44 @@ class TokenStructureInfo:
     symbol_name: str | None
     scope_path: tuple[str, ...]
     file_id: str
+    symbol_line: int | None = None
+    syntax_node_type: str | None = None
+
+
+@dataclass(slots=True)
+class ParseNode:
+    node_id: str
+    node_type: str
+    start_byte: int
+    end_byte: int
+    depth: int
+    language: str
+    is_named: bool
+    parent_id: str | None = None
+    field_name: str | None = None
+
+
+@dataclass(slots=True)
+class ParseDocument:
+    language: str
+    parser_backend: str
+    root_type: str
+    nodes: list[ParseNode]
+    error_count: int
+    error_messages: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class SyntaxStateFeatures:
+    token_index: int
+    node_type: str
+    parent_type: str | None
+    depth: int
+    inside_call: bool
+    inside_literal: bool
+    inside_comment: bool
+    block_depth: int
+    parser_language: str
 
 
 @dataclass(slots=True)
@@ -80,6 +118,8 @@ class AlignedDocument:
     ast_nodes: list[ASTNodeSpan] = field(default_factory=list)
     symbols: list[SymbolSpan] = field(default_factory=list)
     token_structures: list[TokenStructureInfo] = field(default_factory=list)
+    parse_document: ParseDocument | None = None
+    syntax_features: list[SyntaxStateFeatures] = field(default_factory=list)
 
     def token_bytes(self, token_index: int) -> bytes:
         token = self.tokens[token_index]
@@ -92,6 +132,8 @@ class AlignedDocument:
             "token_count": len(self.tokens),
             "ast_nodes": len(self.ast_nodes),
             "symbols": len(self.symbols),
+            "parser_backend": self.parse_document.parser_backend if self.parse_document else None,
+            "parse_errors": self.parse_document.error_count if self.parse_document else 0,
         }
 
 
@@ -155,7 +197,11 @@ class ColdCluster:
 @dataclass(slots=True)
 class SemanticReadResult:
     per_level_outputs: list[torch.Tensor]
+    per_level_hot_outputs: list[torch.Tensor]
+    per_level_cold_outputs: list[torch.Tensor]
     entropies: dict[int, float]
+    hot_entropies: dict[int, float]
+    cold_entropies: dict[int, float]
     maintenance_invocations: int
     hot_reads: int
     cold_reads: int
@@ -238,6 +284,26 @@ class RepositoryGraphNode:
 
 
 @dataclass(slots=True)
+class GraphNodeFeatures:
+    node_id: str
+    kind: str
+    language: str
+    terms: tuple[str, ...]
+    scope_path: tuple[str, ...]
+    edge_kinds: tuple[str, ...]
+    metadata_flags: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class NeuralGraphCache:
+    node_ids: tuple[str, ...]
+    feature_terms: tuple[tuple[str, ...], ...]
+    scope_paths: tuple[tuple[str, ...], ...]
+    edge_kinds: tuple[tuple[str, ...], ...]
+    metadata_flags: tuple[tuple[str, ...], ...]
+
+
+@dataclass(slots=True)
 class RepositoryGraphEdge:
     source_id: str
     target_id: str
@@ -290,6 +356,7 @@ class RepoGraphReadResult:
     log_distribution: torch.Tensor
     attention: torch.Tensor
     copy_token_ids: torch.Tensor
+    candidate_scores: torch.Tensor
     candidate_node_ids: tuple[str, ...]
     candidate_kinds: tuple[str, ...]
     candidate_names: tuple[str, ...]
@@ -302,6 +369,26 @@ class RepoGraphReadResult:
     symbol_hits: int
     test_hits: int
     diagnostic_hits: int
+    target_node_id: str | None = None
+
+
+@dataclass(slots=True)
+class RouterFeatures:
+    pre_features: torch.Tensor
+    post_features: torch.Tensor
+    availability_mask: torch.Tensor
+
+
+@dataclass(slots=True)
+class RouterDecision:
+    pre_logits: torch.Tensor
+    expensive_probs: torch.Tensor
+    pre_mask: torch.Tensor
+    post_logits: torch.Tensor
+    weights: torch.Tensor
+    post_mask: torch.Tensor
+    energy_proxy: torch.Tensor
+    always_on_energy: torch.Tensor
 
 
 @dataclass(slots=True)
@@ -319,6 +406,14 @@ class PhaseAOutput:
     graph_logits: torch.Tensor | None
     graph_attention: torch.Tensor | None
     graph_copy_target_mask: torch.Tensor | None
+    base_hidden_states: torch.Tensor | None
+    graph_contexts: torch.Tensor | None
+    router_weights: torch.Tensor | None
+    router_pre_mask: torch.Tensor | None
+    router_post_mask: torch.Tensor | None
+    lane_entropies: torch.Tensor | None
+    invoked_lanes: torch.Tensor | None
+    energy_proxy: torch.Tensor | None
     hidden_states: torch.Tensor
     semantic_contexts: torch.Tensor
     diagnostics: dict[str, float]

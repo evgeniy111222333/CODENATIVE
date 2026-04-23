@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,31 @@ class PhaseAModelConfig:
     graph_test_bias: float = 1.0
     graph_diagnostic_bias: float = 1.0
     repo_max_files: int = 256
+    parser_backend: str = "tree-sitter"
+    supported_languages: list[str] = field(
+        default_factory=lambda: ["python", "javascript", "typescript", "json", "yaml", "toml", "ini"]
+    )
+    max_parse_errors: int = 32
+    graph_value_dim: int = 128
+    graph_out_blend: float = 1.0
+    symbol_link_weight: float = 0.1
+    pre_router_hidden_dim: int = 128
+    post_router_hidden_dim: int = 128
+    route_temperature: float = 1.0
+    route_top_k: int = 2
+    route_threshold_cold_semantic: float = 0.35
+    route_threshold_eem: float = 0.35
+    route_threshold_graph: float = 0.35
+    route_weight: float = 0.1
+    energy_weight: float = 0.01
+    route_consistency_weight: float = 0.02
+    lane_cost_lm: float = 1.0
+    lane_cost_semantic_hot: float = 1.0
+    lane_cost_erm: float = 1.0
+    lane_cost_semantic_cold: float = 2.0
+    lane_cost_eem: float = 2.5
+    lane_cost_graph: float = 2.5
+    maintenance_cost: float = 0.5
 
 
 @dataclass(slots=True)
@@ -183,3 +208,95 @@ class HTMCodeNativeConfig:
     @property
     def repo_max_files(self) -> int:
         return self.model.repo_max_files
+
+    @property
+    def parser_backend(self) -> str:
+        return self.model.parser_backend
+
+    @property
+    def supported_languages(self) -> list[str]:
+        return self.model.supported_languages
+
+    @property
+    def max_parse_errors(self) -> int:
+        return self.model.max_parse_errors
+
+    @property
+    def graph_value_dim(self) -> int:
+        return self.model.graph_value_dim
+
+    @property
+    def graph_out_blend(self) -> float:
+        return self.model.graph_out_blend
+
+    @property
+    def symbol_link_weight(self) -> float:
+        return self.model.symbol_link_weight
+
+    @property
+    def pre_router_hidden_dim(self) -> int:
+        return self.model.pre_router_hidden_dim
+
+    @property
+    def post_router_hidden_dim(self) -> int:
+        return self.model.post_router_hidden_dim
+
+    @property
+    def route_temperature(self) -> float:
+        return self.model.route_temperature
+
+    @property
+    def route_top_k(self) -> int:
+        return self.model.route_top_k
+
+    @property
+    def route_threshold_cold_semantic(self) -> float:
+        return self.model.route_threshold_cold_semantic
+
+    @property
+    def route_threshold_eem(self) -> float:
+        return self.model.route_threshold_eem
+
+    @property
+    def route_threshold_graph(self) -> float:
+        return self.model.route_threshold_graph
+
+    @property
+    def route_weight(self) -> float:
+        return self.model.route_weight
+
+    @property
+    def energy_weight(self) -> float:
+        return self.model.energy_weight
+
+    @property
+    def route_consistency_weight(self) -> float:
+        return self.model.route_consistency_weight
+
+    @property
+    def lane_cost_lm(self) -> float:
+        return self.model.lane_cost_lm
+
+    @property
+    def lane_cost_semantic_hot(self) -> float:
+        return self.model.lane_cost_semantic_hot
+
+    @property
+    def lane_cost_erm(self) -> float:
+        return self.model.lane_cost_erm
+
+    @property
+    def lane_cost_semantic_cold(self) -> float:
+        return self.model.lane_cost_semantic_cold
+
+    @property
+    def lane_cost_eem(self) -> float:
+        return self.model.lane_cost_eem
+
+    @property
+    def lane_cost_graph(self) -> float:
+        return self.model.lane_cost_graph
+
+    @property
+    def maintenance_cost(self) -> float:
+        return self.model.maintenance_cost

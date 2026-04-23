@@ -1350,6 +1350,613 @@ Recommended policy:
 
 ---
 
+## 14.12 Stable joint training of all components
+
+The train-coupled system is split into five primary parameter blocks:
+
+1. **Backbone / HSSM**: $\Theta_{\mathrm{B}}$
+2. **Semantic memory (SHM query/key/value projections, hot read heads)**: $\Theta_{\mathrm{S}}$
+3. **Exact Recent Memory adapters (ERM query/copy heads)**: $\Theta_{\mathrm{R}}$
+4. **Exact Episodic Memory adapters (EEM chunk query/pointer heads)**: $\Theta_{\mathrm{E}}$
+5. **Router + output heads**: $\Theta_{\mathrm{U}}$
+
+Repository Graph Memory is treated differently:
+
+- the **graph store itself** is mostly non-gradient structured data;
+- only graph query projections, node adapters, and graph-aware heads are optimized online;
+- therefore, graph-trainable parameters are attached to $\Theta_{\mathrm{U}}$ unless a dedicated graph encoder is introduced.
+
+This distinction is mandatory. Otherwise the model becomes unstable by trying to backpropagate through mutable indexes, immutable byte archives, and maintenance operations that are not meant to be in the main autograd graph.
+
+---
+
+## 14.12.1 Loss normalization and activation masks
+
+Every auxiliary loss must be normalized by the number of valid supervision events:
+
+$$
+\bar{\mathcal{L}}_i
+=
+\frac{\mathcal{L}_i}{N_i + \varepsilon}
+$$
+
+where:
+
+- $i$ indexes a loss term;
+- $N_i$ is the number of valid events for that term in the batch;
+- $\varepsilon > 0$ is a small constant.
+
+Examples:
+
+- for $\mathcal{L}_{\mathrm{CopyR}}$, only steps where the target token is present in ERM count toward $N_i$;
+- for $\mathcal{L}_{\mathrm{Ptr}}$, only steps where the target is inside a retrieved EEM chunk count toward $N_i$;
+- for $\mathcal{L}_{\mathrm{Sym}}$, only steps with valid symbol labels count toward $N_i$.
+
+Each trainable term is also guarded by a phase activation gate:
+
+$$
+a_i(u) \in [0,1]
+$$
+
+where $u$ is the global optimizer step. The effective objective is:
+
+$$
+\mathcal{L}_{\mathrm{train}}(u)
+=
+\sum_i
+a_i(u)\,
+\lambda_i^{\mathrm{eff}}(u)\,
+\bar{\mathcal{L}}_i(u)
+$$
+
+Diagnostic-only terms remain outside $\mathcal{L}_{\mathrm{train}}$.
+
+---
+
+## 14.12.2 Dynamic loss balancing
+
+Auxiliary losses must not silently dominate autoregressive learning. Therefore each non-core term uses a capped effective weight:
+
+$$
+\lambda_i^{\mathrm{eff}}(u)
+=
+\lambda_i
+\min\left(
+1,\;
+r_i \cdot
+\frac{\mathrm{EMA}_W[\bar{\mathcal{L}}_{\mathrm{AR}}]}
+{\mathrm{EMA}_W[\bar{\mathcal{L}}_i] + \varepsilon}
+\right)
+$$
+
+where:
+
+- $\mathrm{EMA}_W[\cdot]$ is a moving average over a window $W$;
+- $r_i$ is the maximum allowed ratio of auxiliary contribution to AR contribution.
+
+Recommended initial caps:
+
+- $r_{\mathrm{Hier}} = 0.25$
+- $r_{\mathrm{Sparse}} = 0.10$
+- $r_{\mathrm{CopyR}} = 0.50$
+- $r_{\mathrm{Ptr}} = 0.50$
+- $r_{\mathrm{Sym}} = 0.25$
+- $r_{\mathrm{Route}} = 0.10$
+- $r_{\mathrm{Energy}} = 0.05$
+
+Interpretation:
+
+- hierarchy and routing may regularize;
+- copy and pointer losses may become strong once their lanes are proven useful;
+- energy penalty must remain weak.
+
+If an auxiliary term still spikes due to noise, the phase gate $a_i(u)$ must be held below $1$ until the corresponding lane is stable.
+
+---
+
+## 14.12.3 Gradient-flow rules
+
+Stable training depends on explicit gradient boundaries.
+
+### Gradient is allowed through:
+
+- token/byte/structure encoders for the current batch;
+- HSSM updates within the current truncated unroll;
+- SHM query/key/value projections for hot memory written and read inside the same train step;
+- ERM query/copy heads;
+- EEM query and in-chunk pointer heads;
+- router and final output heads.
+
+### Gradient is not allowed through:
+
+- raw UTF-8 byte storage itself;
+- token IDs and alignment maps as discrete metadata;
+- immutable EEM chunk payloads after they are committed;
+- search-tree construction;
+- consolidation clustering;
+- graph indexing and repository scan passes;
+- memory state carried across independent training sequences.
+
+Formally, for any persistent state $M^{(u)}$ carried from optimizer step $u$ to $u+1$:
+
+$$
+\frac{\partial \mathcal{L}^{(u+1)}}{\partial M^{(u)}} = 0
+$$
+
+unless that state is still inside the same truncated training unroll.
+
+If truncated BPTT length is $K_{\mathrm{bptt}}$, then:
+
+$$
+\frac{\partial \mathcal{L}_t}{\partial s_{t-k}} = 0
+\quad \text{for } k > K_{\mathrm{bptt}}
+$$
+
+after the detach boundary.
+
+This rule is required for both stability and energy efficiency.
+
+---
+
+## 14.12.4 Router warmup and anti-collapse protocol
+
+The router must not learn from scratch in full free-routing mode. It should first be trained with soft oracle guidance.
+
+Let $A_m^{(t)} \in \{0,1\}$ indicate whether lane $m$ can recover the target at step $t$:
+
+- ERM lane: target exists in recent exact window;
+- EEM lane: target exists in selected chunk;
+- graph lane: correct symbol node is available;
+- semantic lane: always available as fallback.
+
+Construct a soft oracle target:
+
+$$
+y_m^{(t)}
+=
+\frac{\exp(\nu A_m^{(t)} + b_m)}
+{\sum_j \exp(\nu A_j^{(t)} + b_j)}
+$$
+
+where $\nu$ controls oracle sharpness and $b_m$ encodes optional priors.
+
+During warmup, the effective router used in the mixture is:
+
+$$
+\tilde{\rho}_m^{(t)}
+=
+(1-\beta_u)\, y_m^{(t)}
++
+\beta_u\, \rho_m^{(t)}
+$$
+
+with $\beta_u$ ramped from $0$ to $1$ over router warmup.
+
+Hard rule:
+
+- before all memory lanes are individually validated, use $\tilde{\rho}$ for mixture;
+- only after warmup completion switch fully to learned $\rho$.
+
+To avoid early router collapse:
+
+- enforce top-2 routing, not top-1, during warmup;
+- apply lane dropout to the dominant lane with small probability;
+- keep a minimum entropy floor for router logits in early phases.
+
+One practical entropy floor is:
+
+$$
+\mathcal{L}_{\mathrm{EntFloor}}
+=
+\lambda_{\mathrm{ent}}
+\sum_t
+\max(0, H_{\min} - H(\rho^{(t)}))
+$$
+
+This term is phase-local and should be disabled once routing has diversified.
+
+---
+
+## 14.12.5 Phase curriculum
+
+The model must not turn on all subsystems at once.
+
+### Phase 0: Representation and indexing bootstrap
+
+- train or fit the code-aware tokenizer;
+- build token-byte alignment maps;
+- build initial repo graph indexes;
+- verify chunking and structure-boundary extraction;
+- no end-to-end model training yet.
+
+### Phase A: Stable semantic backbone
+
+Train:
+
+- $\Theta_{\mathrm{B}}$
+- $\Theta_{\mathrm{S}}$
+- base LM head inside $\Theta_{\mathrm{U}}$
+
+Active losses:
+
+- $\mathcal{L}_{\mathrm{AR}}$
+- $\mathcal{L}_{\mathrm{INFILL}}$
+- $\mathcal{L}_{\mathrm{Hier}}$
+- $\mathcal{L}_{\mathrm{Sparse}}$
+
+Disabled:
+
+- ERM copy loss
+- EEM pointer loss
+- graph symbol loss
+- free router mixing
+
+Policy:
+
+- router is forced to semantic lane only;
+- cold consolidation is delayed or very infrequent;
+- diagnostics are sampled, not dense.
+
+Exit criteria:
+
+- no NaNs for a long validation window;
+- AR improves monotonically in EMA terms;
+- hierarchy loss plateaus below a configured threshold;
+- hot/cold semantic reads do not explode latency.
+
+### Phase B: ERM introduction
+
+Train:
+
+- $\Theta_{\mathrm{B}}$
+- $\Theta_{\mathrm{S}}$
+- $\Theta_{\mathrm{R}}$
+- copy-aware part of $\Theta_{\mathrm{U}}$
+
+New active loss:
+
+- $\mathcal{L}_{\mathrm{CopyR}}$
+
+Policy:
+
+- router may choose between semantic and recent-exact lanes only;
+- use oracle-guided $\tilde{\rho}$;
+- ERM is always written every step;
+- EEM and graph lane remain frozen.
+
+Exit criteria:
+
+- recent-copy accuracy clears a target threshold on synthetic and real probes;
+- router uses ERM when exact target is present, but does not overuse it when absent.
+
+### Phase C: EEM introduction
+
+Train:
+
+- $\Theta_{\mathrm{E}}$
+- pointer-aware part of $\Theta_{\mathrm{U}}$
+- all previous active blocks remain trainable
+
+New active loss:
+
+- $\mathcal{L}_{\mathrm{Ptr}}$
+
+Policy:
+
+- EEM is built from immutable chunks only;
+- chunk selection may be teacher-guided early on;
+- router now mixes semantic + ERM + EEM;
+- graph lane still frozen.
+
+Exit criteria:
+
+- chunk retrieval recall is stable;
+- pointer accuracy is materially above random and above semantic-only baseline;
+- EEM does not destroy tokens/sec beyond the accepted budget.
+
+### Phase D: Graph lane introduction
+
+Train:
+
+- graph query projections and graph-aware heads in $\Theta_{\mathrm{U}}$
+- optional graph-node adapters if used
+
+New active loss:
+
+- $\mathcal{L}_{\mathrm{Sym}}$
+
+Policy:
+
+- repository graph payload stays external or semi-static;
+- graph refresh happens offline or at low frequency;
+- graph lane is enabled only on tasks that actually require symbol reasoning.
+
+Exit criteria:
+
+- symbol-link top-1/top-k reaches target levels;
+- graph lane improves cross-file reasoning without collapsing router diversity.
+
+### Phase E: Full router activation
+
+Train:
+
+- full $\Theta_{\mathrm{U}}$
+- all already enabled memory lanes
+
+New active loss:
+
+- full $\mathcal{L}_{\mathrm{Route}}$
+- optional weak $\mathcal{L}_{\mathrm{Energy}}$
+
+Policy:
+
+- switch from oracle-guided $\tilde{\rho}$ to learned $\rho$ gradually;
+- top-2 routing may remain as a permanent efficiency constraint;
+- per-lane usage is monitored continuously.
+
+Exit criteria:
+
+- no persistent single-lane collapse;
+- validation quality improves over phase-isolated baselines;
+- compute overhead stays inside budget.
+
+### Phase F: Joint fine-tuning
+
+Train all enabled blocks jointly with full task mix.
+
+Policy:
+
+- auxiliary caps remain active;
+- maintenance is scheduled, never dense;
+- exact-recall, repo-edit, and long-context benchmarks all gate acceptance.
+
+---
+
+## 14.12.6 Optimizer groups and learning-rate ratios
+
+Use AdamW or a similarly stable optimizer with parameter groups:
+
+$$
+\eta_{\mathrm{B}} = \eta
+$$
+
+$$
+\eta_{\mathrm{S}} = 0.7 \eta
+$$
+
+$$
+\eta_{\mathrm{R}} = 0.7 \eta
+$$
+
+$$
+\eta_{\mathrm{E}} = 0.5 \eta
+$$
+
+$$
+\eta_{\mathrm{U}} =
+\begin{cases}
+0.3 \eta, & \text{during router warmup} \\
+0.7 \eta, & \text{after router stabilizes}
+\end{cases}
+$$
+
+Recommended gradient clipping by group:
+
+- backbone/HSSM: $\|g\|_2 \le 1.0$
+- SHM: $\|g\|_2 \le 0.5$
+- ERM: $\|g\|_2 \le 0.5$
+- EEM: $\|g\|_2 \le 0.5$
+- router/heads: $\|g\|_2 \le 0.25$
+
+Reason:
+
+- router and pointer heads are high-variance;
+- memory projections are more fragile than the backbone;
+- clipping per group prevents one unstable lane from corrupting the whole step.
+
+---
+
+## 14.12.7 Maintenance scheduling
+
+Memory maintenance must be separated from the main gradient path.
+
+Define the consolidation trigger:
+
+$$
+\chi_{\mathrm{cons}}(u)
+=
+\mathbf{1}\Big[
+u > U_{\mathrm{warm}}
+\;\land\;
+\mathrm{occ}_{\mathrm{hot}}(u) > \tau_{\mathrm{occ}}
+\;\land\;
+u \bmod K_{\mathrm{cons}} = 0
+\;\land\;
+\Delta \mathrm{EMA}_W[\mathcal{L}_{\mathrm{AR}}] \le \delta_{\mathrm{spike}}
+\Big]
+$$
+
+Interpretation:
+
+- do not consolidate too early;
+- only consolidate if hot memory occupancy justifies it;
+- do not consolidate during a loss spike.
+
+Maintenance rules:
+
+- SHM hot write: every step
+- ERM ring write: every step
+- EEM chunk finalization: only on chunk boundary or structural close
+- SHM consolidation: only when $\chi_{\mathrm{cons}}(u)=1$
+- search-tree rebuild: only after a consolidation or bulk cold-memory update
+- graph refresh: offline, per repo snapshot, or at low periodicity
+
+All maintenance operations run under `no_grad()` unless there is a dedicated auxiliary optimization pass designed specifically for them.
+
+---
+
+## 14.12.8 Task-mixture curriculum
+
+The training data mixture must also follow the phase schedule.
+
+Recommended starting curriculum:
+
+- **Phase A**
+  - 70% autoregressive code modeling
+  - 30% infill / span completion
+
+- **Phase B**
+  - 55% autoregressive code modeling
+  - 20% infill
+  - 25% recent exact-recall and copy probes
+
+- **Phase C**
+  - 45% autoregressive code modeling
+  - 15% infill
+  - 20% recent copy probes
+  - 20% episodic chunk-recall tasks
+
+- **Phase D / E / F**
+  - 35% autoregressive code modeling
+  - 15% infill
+  - 15% recent copy probes
+  - 15% episodic recall
+  - 20% repo-level tasks (symbol linking, definition-use matching, edit/fix tasks)
+
+This mixture is a default, not a law. But the key constraint is fixed:
+
+- do not train the router or graph lane mostly on plain next-token tasks;
+- explicitly show the model tasks that require exact recall and repo reasoning.
+
+---
+
+## 14.12.9 Per-step training algorithm
+
+For each optimizer step:
+
+1. sample a batch with task labels and phase-appropriate supervision;
+2. build or load alignment metadata and structure boundaries;
+3. run forward pass only through lanes enabled in the current phase;
+4. compute oracle availability masks $A_m^{(t)}$ for enabled lanes;
+5. compute router weights $\rho$ and warmup mixture $\tilde{\rho}$ if router warmup is active;
+6. compute all active normalized losses $\bar{\mathcal{L}}_i$;
+7. compute effective weights $\lambda_i^{\mathrm{eff}}(u)$;
+8. backpropagate only through $\mathcal{L}_{\mathrm{train}}(u)$;
+9. apply per-group gradient clipping;
+10. take optimizer step;
+11. if $\chi_{\mathrm{cons}}(u)=1$, run maintenance under `no_grad()`;
+12. log:
+   - AR
+   - active auxiliary losses
+   - router entropy
+   - per-lane utilization
+   - exact recall metrics
+   - tokens/sec
+   - maintenance latency
+
+This order is part of the concept, not an implementation detail.
+
+---
+
+## 14.12.10 Failure detectors and mandatory reactions
+
+The concept requires explicit failure handling.
+
+### Router collapse
+
+Condition:
+
+- one lane gets $> 95\%$ mean routing mass over a long window before all lanes are validated.
+
+Reaction:
+
+- reduce $\beta_u$ growth;
+- re-enable oracle-guided mixture;
+- increase lane dropout on the dominant lane;
+- increase router entropy floor temporarily.
+
+### Auxiliary domination
+
+Condition:
+
+- any auxiliary contribution persistently exceeds its configured cap relative to AR.
+
+Reaction:
+
+- reduce $\lambda_i^{\mathrm{eff}}$ automatically;
+- if needed, freeze that lane for a short recovery interval.
+
+### Memory-maintenance instability
+
+Condition:
+
+- AR jumps immediately after consolidation windows;
+- tokens/sec collapses after maintenance is enabled.
+
+Reaction:
+
+- increase $K_{\mathrm{cons}}$;
+- increase occupancy threshold $\tau_{\mathrm{occ}}$;
+- disable consolidation during the next recovery window;
+- keep cold compression and tree build in FP32 if numerically fragile.
+
+### Exact-lane hallucination
+
+Condition:
+
+- ERM/EEM lane receives high router weight even when target is absent or recall accuracy is low.
+
+Reaction:
+
+- strengthen router supervision;
+- lower lane prior;
+- require availability mask consistency during warmup.
+
+### Graph overreach
+
+Condition:
+
+- graph lane dominates on tasks that are local-file or recent-context only.
+
+Reaction:
+
+- lower graph prior outside repo tasks;
+- gate graph lane by task type;
+- penalize unnecessary graph usage through the energy term.
+
+---
+
+## 14.12.11 Phase-transition metrics
+
+A phase transition is allowed only if all required metrics pass.
+
+Recommended minimum checks:
+
+- **Phase A -> B**
+  - stable AR improvement
+  - no gradient explosions
+  - semantic-only baseline established
+
+- **Phase B -> C**
+  - recent-copy top-1 accuracy clears target on held-out probes
+  - router uses ERM selectively, not blindly
+
+- **Phase C -> D**
+  - episodic chunk recall and pointer accuracy materially exceed semantic-only baseline
+
+- **Phase D -> E**
+  - symbol-link metrics improve on cross-file tasks
+  - graph lane latency remains acceptable
+
+- **Phase E -> F**
+  - router diversity is healthy
+  - full mixture outperforms ablations
+  - energy and throughput remain within budget
+
+If a phase fails its exit checks, training must not progress just because loss is still decreasing.
+
+---
+
 ## 15. Inference algorithms
 
 ## 15.1 Streaming completion

@@ -8,8 +8,7 @@ from htm_code_native.config.settings import HTMCodeNativeConfig
 from htm_code_native.data.featurizer import build_batch_from_document
 from htm_code_native.data.vocabulary import VocabularyRegistry
 from htm_code_native.tokenizer.boundary import BoundaryScheduler
-from htm_code_native.tokenizer.python_tokenizer import PythonTokenizer
-from htm_code_native.tokenizer.structure import PythonStructureExtractor
+from htm_code_native.tokenizer.tree_sitter_backend import detect_language, parse_source_document
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -22,12 +21,9 @@ def config() -> HTMCodeNativeConfig:
 
 @pytest.fixture()
 def build_document():
-    tokenizer = PythonTokenizer()
-    extractor = PythonStructureExtractor()
-
     def _build(path: Path):
         source = path.read_text(encoding="utf-8")
-        return extractor.enrich(tokenizer.encode(source, str(path)))
+        return parse_source_document(source, str(path), language=detect_language(str(path)))
 
     return _build
 

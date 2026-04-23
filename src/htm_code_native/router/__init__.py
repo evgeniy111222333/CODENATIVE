@@ -1,3 +1,3 @@
-from htm_code_native.router.stub import NoOpRouter, RouterAdapter
+from htm_code_native.router.stub import NoOpRouter, RouterAdapter, TwoStageRouter
 
-__all__ = ["NoOpRouter", "RouterAdapter"]
+__all__ = ["NoOpRouter", "RouterAdapter", "TwoStageRouter"]

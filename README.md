@@ -1,6 +1,6 @@
 # HTM Code-Native
 
-Phases A, B, and C of the `HTM_Code_Native_Final_Concept.md` architecture.
+Phases A, B, C, and D of the `HTM_Code_Native_Final_Concept.md` architecture.
 
 This repository bootstraps a working vertical slice for:
 
@@ -12,6 +12,7 @@ This repository bootstraps a working vertical slice for:
 - semantic hot/cold memory
 - exact recent memory (ERM)
 - exact episodic memory (EEM)
+- repository graph memory (RGM)
 - fused LM/copy output and smoke-train loop
 
 ## Layout
@@ -29,9 +30,10 @@ tests/
 ```bash
 python -m htm_code_native.cli tokenize tests/fixtures/sample_module.py
 python -m htm_code_native.cli inspect tests/fixtures/sample_module.py
-python -m htm_code_native.cli run-forward tests/fixtures/episodic_copy_module.py
+python -m htm_code_native.cli inspect tests/fixtures/repo_graph_workspace/app/core.py --repo-root tests/fixtures/repo_graph_workspace --report-path tests/fixtures/repo_graph_workspace/reports/junit.xml --report-path tests/fixtures/repo_graph_workspace/reports/eslint.json
+python -m htm_code_native.cli run-forward tests/fixtures/repo_graph_workspace/app/core.py --repo-root tests/fixtures/repo_graph_workspace --report-path tests/fixtures/repo_graph_workspace/reports/junit.xml --report-path tests/fixtures/repo_graph_workspace/reports/eslint.json
 python -m htm_code_native.cli smoke-train
-python benchmarks/microbench.py tests/fixtures/episodic_copy_module.py
+python benchmarks/microbench.py tests/fixtures/repo_graph_workspace/app/core.py --repo-root tests/fixtures/repo_graph_workspace --report-path tests/fixtures/repo_graph_workspace/reports/junit.xml --report-path tests/fixtures/repo_graph_workspace/reports/eslint.json
 ```
 
 ## Status
@@ -41,10 +43,10 @@ The repository now includes:
 - Phase A semantic core
 - Phase B exact recent memory
 - Phase C exact episodic memory
+- Phase D repository graph memory
 
 Still deferred:
 
-- repository graph memory (RGM)
 - learned retrieval router
 
 The main executable path is `PythonTokenizer -> PythonStructureExtractor -> BoundaryScheduler -> PhaseACodeModel`.
