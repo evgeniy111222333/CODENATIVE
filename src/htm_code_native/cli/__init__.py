@@ -10,6 +10,7 @@ from htm_code_native.config.settings import HTMCodeNativeConfig
 from htm_code_native.data.featurizer import build_batch_from_document
 from htm_code_native.data.types import TaskExample, TaskLabel, TrainingPhase
 from htm_code_native.data.vocabulary import VocabularyRegistry
+from htm_code_native.editing.planner import build_edit_request, run_edit_plan
 from htm_code_native.losses.core import (
     autoregressive_loss,
     cap_auxiliary_losses,
@@ -268,6 +269,97 @@ def command_run_forward(args: argparse.Namespace) -> int:
     }
     print(json.dumps(payload, indent=2))
     return 0
+
+
+def command_edit_plan(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    phase = resolve_phase(args, config)
+    request = build_edit_request(
+        file_path=args.file_path,
+        instruction=args.instruction,
+        repo_root=args.repo_root,
+        report_paths=args.report_path,
+        target_symbol=args.target_symbol,
+        phase=phase,
+        max_candidates=args.max_candidates or config.model.edit_max_candidates,
+    )
+    model = PhaseACodeModel(config)
+    output = run_edit_plan(model, request, config)
+    payload = {
+        "request": {
+            "file_path": output.request.file_path,
+            "instruction": output.request.instruction,
+            "repo_root": output.request.repo_root,
+            "report_paths": list(output.request.report_paths),
+            "target_symbol": output.request.target_symbol,
+            "phase": output.request.phase,
+            "max_candidates": output.request.max_candidates,
+        },
+        "selected_context": output.selected_context,
+        "router_summary": output.router_summary,
+        "span_candidates": [_edit_span_to_json(span) for span in output.span_candidates],
+        "patch_candidates": [
+            {
+                "candidate_index": index,
+                "span": _edit_span_to_json(candidate.span),
+                "replacement_text": candidate.replacement_text,
+                "valid": candidate.valid,
+                "validation_errors": list(candidate.validation_errors),
+                "score": candidate.score,
+                "support_terms": list(candidate.support_terms),
+                "diff_preview": candidate.diff_preview,
+            }
+            for index, candidate in enumerate(output.patch_plan.patch_candidates)
+        ],
+        "apply_results": [
+            {
+                "candidate_index": result.candidate_index,
+                "span": _edit_span_to_json(result.span),
+                "replacement_text": result.replacement_text,
+                "patched_source_hash": result.patched_source_hash,
+                "patched_source_length": result.patched_source_length,
+                "diff_preview": result.diff_preview,
+                "applied": result.applied,
+                "valid": result.valid,
+                "validation_errors": list(result.validation_errors),
+                "syntax_error_count": result.syntax_error_count,
+            }
+            for result in output.apply_results
+        ],
+        "best_candidate_index": (
+            output.best_apply_result.candidate_index
+            if output.best_apply_result is not None
+            else None
+        ),
+        "best_diff_preview": output.diff_preview,
+        "validation_summary": output.validation_summary,
+        "verification_summary": (
+            {
+                "candidate_count": output.verification_summary.candidate_count,
+                "apply_success_rate": output.verification_summary.apply_success_rate,
+                "syntax_valid_rate": output.verification_summary.syntax_valid_rate,
+                "best_candidate_apply_valid": output.verification_summary.best_candidate_apply_valid,
+            }
+            if output.verification_summary is not None
+            else None
+        ),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _edit_span_to_json(span) -> dict[str, object]:
+    return {
+        "start_byte": span.start_byte,
+        "end_byte": span.end_byte,
+        "token_start": span.token_start,
+        "token_end": span.token_end,
+        "node_type": span.node_type,
+        "symbol_name": span.symbol_name,
+        "score": span.score,
+        "reasons": list(span.reasons),
+        "source_text": span.source_text,
+    }
 
 
 def command_smoke_train(args: argparse.Namespace) -> int:
@@ -587,6 +679,17 @@ def build_parser() -> argparse.ArgumentParser:
     forward_parser.add_argument("--report-path", action="append", default=[])
     forward_parser.add_argument("--phase")
     forward_parser.set_defaults(func=command_run_forward)
+
+    edit_parser = subparsers.add_parser("edit-plan")
+    edit_parser.add_argument("file_path")
+    edit_parser.add_argument("--config")
+    edit_parser.add_argument("--repo-root")
+    edit_parser.add_argument("--report-path", action="append", default=[])
+    edit_parser.add_argument("--phase", default=TrainingPhase.PHASE_E.value)
+    edit_parser.add_argument("--instruction", required=True)
+    edit_parser.add_argument("--target-symbol")
+    edit_parser.add_argument("--max-candidates", type=int)
+    edit_parser.set_defaults(func=command_edit_plan)
 
     smoke_parser = subparsers.add_parser("smoke-train")
     smoke_parser.add_argument("--config")

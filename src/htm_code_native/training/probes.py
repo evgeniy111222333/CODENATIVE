@@ -89,6 +89,9 @@ def run_phase_exit_probes(
         "patch_candidate_valid_rate": [],
         "best_patch_hit_rate": [],
         "diagnostic_to_span_recall": [],
+        "patch_apply_success_rate": [],
+        "patch_syntax_valid_rate": [],
+        "best_patch_apply_valid_rate": [],
     }
 
     start = time.perf_counter()
@@ -210,6 +213,11 @@ def run_phase_exit_probes(
                 metrics_accumulator["patch_candidate_valid_rate"].append(planner_metrics["patch_candidate_valid_rate"])
                 metrics_accumulator["best_patch_hit_rate"].append(planner_metrics["best_patch_hit_rate"])
                 metrics_accumulator["diagnostic_to_span_recall"].append(planner_metrics["diagnostic_to_span_recall"])
+                metrics_accumulator["patch_apply_success_rate"].append(planner_metrics["patch_apply_success_rate"])
+                metrics_accumulator["patch_syntax_valid_rate"].append(planner_metrics["patch_syntax_valid_rate"])
+                metrics_accumulator["best_patch_apply_valid_rate"].append(
+                    planner_metrics["best_patch_apply_valid_rate"]
+                )
 
         cold_metrics = _cold_semantic_probe_metrics(
             model=model,
@@ -255,6 +263,10 @@ def run_phase_exit_probes(
             failing_checks.append("best_patch_below_threshold")
         if aggregate_metrics["diagnostic_to_span_recall"] < config.model.probe_min_diagnostic_to_span_recall:
             failing_checks.append("diagnostic_to_span_below_threshold")
+        if aggregate_metrics["patch_apply_success_rate"] < config.model.probe_min_patch_apply_success_rate:
+            failing_checks.append("patch_apply_below_threshold")
+        if aggregate_metrics["patch_syntax_valid_rate"] < config.model.probe_min_patch_syntax_valid_rate:
+            failing_checks.append("patch_syntax_below_threshold")
 
     if was_training:
         model.train()
@@ -435,6 +447,9 @@ def _planner_probe_metrics(edit_output, task_batch: TaskBatch) -> dict[str, floa
         "patch_candidate_valid_rate": valid_rate,
         "best_patch_hit_rate": best_patch_hit,
         "diagnostic_to_span_recall": float(bool(overlapping_spans)),
+        "patch_apply_success_rate": float(edit_output.validation_summary.get("patch_apply_success_rate", 0.0)),
+        "patch_syntax_valid_rate": float(edit_output.validation_summary.get("patch_syntax_valid_rate", 0.0)),
+        "best_patch_apply_valid_rate": float(edit_output.validation_summary.get("best_patch_apply_valid_rate", 0.0)),
     }
 
 

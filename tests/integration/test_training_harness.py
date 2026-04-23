@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from htm_code_native.cli import main
@@ -137,6 +138,45 @@ def test_phase_e_probes_include_planner_metrics(config) -> None:
     assert "diagnostic_to_span_recall" in report.metrics
     assert "edit_fix_copy_hit_rate" in report.metrics
     assert "cold_semantic_invocation_rate" in report.metrics
+    assert "patch_apply_success_rate" in report.metrics
+    assert "patch_syntax_valid_rate" in report.metrics
+    assert "best_patch_apply_valid_rate" in report.metrics
+    assert report.metrics["patch_apply_success_rate"] > 0.0
+    assert report.metrics["patch_syntax_valid_rate"] > 0.0
+
+
+def test_cli_edit_plan_is_dry_run_and_reports_apply_results(capsys) -> None:
+    file_path = REPO_GRAPH_ROOT / "app" / "core.py"
+    original_source = file_path.read_text(encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "edit-plan",
+                str(file_path),
+                "--phase",
+                "phase_e",
+                "--repo-root",
+                str(REPO_GRAPH_ROOT),
+                "--report-path",
+                REPO_GRAPH_REPORTS[0],
+                "--report-path",
+                REPO_GRAPH_REPORTS[1],
+                "--target-symbol",
+                "GRAPH_SHARED_NAME",
+                "--instruction",
+                'Replace GRAPH_SHARED_NAME with "shared_graph_token"',
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert file_path.read_text(encoding="utf-8") == original_source
+    assert payload["apply_results"]
+    assert payload["verification_summary"]["candidate_count"] == len(payload["apply_results"])
+    assert payload["validation_summary"]["patch_apply_success_rate"] > 0.0
+    assert "--apply" not in payload
 
 
 def test_cli_eval_only_phase_report() -> None:

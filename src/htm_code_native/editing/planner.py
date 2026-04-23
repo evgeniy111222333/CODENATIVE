@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import difflib
+import hashlib
 import re
 import time
 from pathlib import Path
@@ -15,8 +16,10 @@ from htm_code_native.data.types import (
     EditRequest,
     EditRunOutput,
     EditTargetSpan,
+    PatchApplyResult,
     PatchCandidate,
     PatchPlan,
+    PatchVerificationSummary,
     RepositoryGraphIndex,
     TaskLabel,
     TrainingPhase,
@@ -25,7 +28,6 @@ from htm_code_native.data.vocabulary import VocabularyRegistry
 from htm_code_native.model.phase_a import PhaseACodeModel
 from htm_code_native.tokenizer.boundary import BoundaryScheduler
 from htm_code_native.tokenizer.tree_sitter_backend import detect_language, parse_source_document
-from htm_code_native.training.tasks import build_repo_graph_index, resolve_repo_root
 
 
 INSTRUCTION_TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -41,6 +43,8 @@ def build_edit_request(
     phase: TrainingPhase | str | None = None,
     max_candidates: int = 3,
 ) -> EditRequest:
+    from htm_code_native.training.tasks import resolve_repo_root
+
     resolved_root = str(resolve_repo_root(file_path, repo_root)) if repo_root or Path(file_path).exists() else repo_root
     phase_name = phase.value if isinstance(phase, TrainingPhase) else phase
     return EditRequest(
@@ -59,6 +63,8 @@ def run_edit_plan(
     request: EditRequest,
     config: HTMCodeNativeConfig,
 ) -> EditRunOutput:
+    from htm_code_native.training.tasks import build_repo_graph_index
+
     document = _parse_document(request.file_path)
     boundaries = BoundaryScheduler(max_level=config.hssm.max_level).build(document)
     registry = VocabularyRegistry(config.model.vocabulary_size)
@@ -103,9 +109,17 @@ def run_edit_plan(
         )
         for span in span_candidates
     )
-    best_candidate = next((candidate for candidate in patch_candidates if candidate.valid), None)
-    if best_candidate is None and patch_candidates:
-        best_candidate = max(patch_candidates, key=lambda candidate: candidate.score)
+    apply_results = tuple(
+        dry_run_apply_patch_candidate(
+            document,
+            candidate,
+            request.file_path,
+            candidate_index=index,
+        )
+        for index, candidate in enumerate(patch_candidates)
+    )
+    best_candidate, best_apply_result = _select_best_patch_candidate(patch_candidates, apply_results)
+    verification_summary = _summarize_apply_results(apply_results, best_apply_result)
     patch_plan = PatchPlan(
         file_path=request.file_path,
         original_source=document.source_text,
@@ -114,6 +128,9 @@ def run_edit_plan(
         validation_summary={
             "valid_candidates": sum(1 for candidate in patch_candidates if candidate.valid),
             "candidate_count": len(patch_candidates),
+            "apply_success_rate": verification_summary.apply_success_rate,
+            "syntax_valid_rate": verification_summary.syntax_valid_rate,
+            "best_candidate_apply_valid": verification_summary.best_candidate_apply_valid,
         },
     )
     validation_summary = {
@@ -121,6 +138,9 @@ def run_edit_plan(
             sum(1 for candidate in patch_candidates if candidate.valid) / max(len(patch_candidates), 1)
         ),
         "best_candidate_valid": bool(best_candidate.valid) if best_candidate is not None else False,
+        "patch_apply_success_rate": verification_summary.apply_success_rate,
+        "patch_syntax_valid_rate": verification_summary.syntax_valid_rate,
+        "best_patch_apply_valid_rate": float(verification_summary.best_candidate_apply_valid),
         "latency_ms": latency_ms,
     }
     selected_context = {
@@ -146,6 +166,9 @@ def run_edit_plan(
         span_candidates=tuple(span_candidates),
         patch_plan=patch_plan,
         diff_preview=best_candidate.diff_preview if best_candidate is not None else "",
+        apply_results=apply_results,
+        best_apply_result=best_apply_result,
+        verification_summary=verification_summary,
         validation_summary=validation_summary,
     )
 
@@ -154,6 +177,57 @@ def render_unified_diff(plan: PatchPlan) -> str:
     if plan.best_candidate is None:
         return ""
     return plan.best_candidate.diff_preview
+
+
+def dry_run_apply_patch_candidate(
+    document: AlignedDocument,
+    candidate: PatchCandidate,
+    file_path: str,
+    *,
+    candidate_index: int = 0,
+) -> PatchApplyResult:
+    applied, patched_source, apply_errors = _apply_replacement_to_document(
+        document=document,
+        span=candidate.span,
+        replacement_text=candidate.replacement_text,
+    )
+    validation_errors: tuple[str, ...] = apply_errors
+    syntax_error_count = 0
+    if applied:
+        valid, validation_errors, syntax_error_count = _validate_patched_source(
+            original_document=document,
+            patched_source=patched_source,
+            span=candidate.span,
+            file_path=file_path,
+            existing_errors=apply_errors,
+        )
+    else:
+        valid = False
+    return PatchApplyResult(
+        candidate_index=candidate_index,
+        span=candidate.span,
+        replacement_text=candidate.replacement_text,
+        patched_source_hash=_source_hash(patched_source),
+        patched_source_length=len(patched_source.encode("utf-8")),
+        diff_preview=_render_diff(document.source_text, patched_source, file_path) if applied else "",
+        applied=applied,
+        valid=valid,
+        validation_errors=validation_errors,
+        syntax_error_count=syntax_error_count,
+    )
+
+
+def dry_run_apply_patch_plan(plan: PatchPlan, file_path: str) -> tuple[PatchApplyResult, ...]:
+    document = parse_source_document(plan.original_source, file_path, language=detect_language(file_path))
+    return tuple(
+        dry_run_apply_patch_candidate(
+            document,
+            candidate,
+            file_path,
+            candidate_index=index,
+        )
+        for index, candidate in enumerate(plan.patch_candidates)
+    )
 
 
 def _parse_document(file_path: str) -> AlignedDocument:
@@ -383,17 +457,22 @@ def _build_patch_candidate(
         output=output,
         span=span,
     )
-    patched_source = (
-        document.raw_bytes[: span.start_byte].decode("utf-8", errors="ignore")
-        + replacement_text
-        + document.raw_bytes[span.end_byte :].decode("utf-8", errors="ignore")
-    )
-    valid, validation_errors = _validate_patch(
-        original_document=document,
-        patched_source=patched_source,
+    applied, patched_source, apply_errors = _apply_replacement_to_document(
+        document=document,
         span=span,
-        file_path=request.file_path,
+        replacement_text=replacement_text,
     )
+    if applied:
+        valid, validation_errors, _syntax_errors = _validate_patched_source(
+            original_document=document,
+            patched_source=patched_source,
+            span=span,
+            file_path=request.file_path,
+            existing_errors=apply_errors,
+        )
+    else:
+        valid = False
+        validation_errors = apply_errors
     diff_preview = _render_diff(document.source_text, patched_source, request.file_path)
     score = span.score + (0.5 if valid else -0.25) + (0.05 * len(support_terms))
     return PatchCandidate(
@@ -472,15 +551,65 @@ def _validate_patch(
     span: EditTargetSpan,
     file_path: str,
 ) -> tuple[bool, tuple[str, ...]]:
+    valid, errors, _syntax_errors = _validate_patched_source(
+        original_document=original_document,
+        patched_source=patched_source,
+        span=span,
+        file_path=file_path,
+    )
+    return valid, errors
+
+
+def _apply_replacement_to_document(
+    *,
+    document: AlignedDocument,
+    span: EditTargetSpan,
+    replacement_text: str,
+) -> tuple[bool, str, tuple[str, ...]]:
     errors: list[str] = []
+    raw = document.raw_bytes
+    if span.start_byte < 0 or span.end_byte > len(raw) or span.start_byte >= span.end_byte:
+        errors.append("span_bounds_invalid")
+        return False, document.source_text, tuple(errors)
+    if replacement_text == "":
+        errors.append("empty_replacement")
+        return False, document.source_text, tuple(errors)
+    patched_raw = (
+        raw[: span.start_byte]
+        + replacement_text.encode("utf-8")
+        + raw[span.end_byte :]
+    )
+    try:
+        patched_source = patched_raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        errors.append(f"utf8_decode:{exc.reason}")
+        return False, document.source_text, tuple(errors)
+    if patched_source == document.source_text:
+        errors.append("unchanged_patch")
+        return False, patched_source, tuple(errors)
+    return True, patched_source, ()
+
+
+def _validate_patched_source(
+    *,
+    original_document: AlignedDocument,
+    patched_source: str,
+    span: EditTargetSpan,
+    file_path: str,
+    existing_errors: tuple[str, ...] = (),
+) -> tuple[bool, tuple[str, ...], int]:
+    errors: list[str] = list(existing_errors)
+    syntax_error_count = 0
     language = detect_language(file_path)
     patched_document = parse_source_document(patched_source, file_path, language=language)
     if patched_document.parse_document is not None and patched_document.parse_document.error_count > 0:
+        syntax_error_count += patched_document.parse_document.error_count
         errors.append(f"tree_sitter_errors:{patched_document.parse_document.error_count}")
     if language == "python":
         try:
             ast.parse(patched_source)
         except SyntaxError as exc:
+            syntax_error_count += 1
             errors.append(f"python_ast:{exc.msg}")
 
     enclosing_symbol = None
@@ -491,7 +620,48 @@ def _validate_patch(
     if enclosing_symbol is not None:
         if not any(symbol.name == enclosing_symbol.name and symbol.kind == enclosing_symbol.kind for symbol in patched_document.symbols):
             errors.append("enclosing_symbol_missing")
-    return not errors, tuple(errors)
+    return not errors, tuple(errors), syntax_error_count
+
+
+def _select_best_patch_candidate(
+    patch_candidates: tuple[PatchCandidate, ...],
+    apply_results: tuple[PatchApplyResult, ...],
+) -> tuple[PatchCandidate | None, PatchApplyResult | None]:
+    if not patch_candidates:
+        return None, None
+    pairs = list(zip(patch_candidates, apply_results, strict=False))
+    valid_pairs = [
+        (candidate, result)
+        for candidate, result in pairs
+        if candidate.valid and result.valid
+    ]
+    if valid_pairs:
+        return max(valid_pairs, key=lambda item: item[0].score)
+    fallback = max(
+        pairs,
+        key=lambda item: item[0].score + (0.25 if item[1].valid else -0.25),
+    )
+    return fallback
+
+
+def _summarize_apply_results(
+    apply_results: tuple[PatchApplyResult, ...],
+    best_apply_result: PatchApplyResult | None,
+) -> PatchVerificationSummary:
+    candidate_count = len(apply_results)
+    return PatchVerificationSummary(
+        candidate_count=candidate_count,
+        apply_success_rate=sum(1 for result in apply_results if result.applied) / max(candidate_count, 1),
+        syntax_valid_rate=(
+            sum(1 for result in apply_results if result.applied and result.syntax_error_count == 0)
+            / max(candidate_count, 1)
+        ),
+        best_candidate_apply_valid=bool(best_apply_result.valid) if best_apply_result is not None else False,
+    )
+
+
+def _source_hash(source: str) -> str:
+    return hashlib.blake2b(source.encode("utf-8"), digest_size=16).hexdigest()
 
 
 def _render_diff(original_source: str, patched_source: str, file_path: str) -> str:

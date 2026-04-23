@@ -629,6 +629,28 @@ class PatchCandidate:
 
 
 @dataclass(slots=True)
+class PatchApplyResult:
+    candidate_index: int
+    span: EditTargetSpan
+    replacement_text: str
+    patched_source_hash: str
+    patched_source_length: int
+    diff_preview: str
+    applied: bool
+    valid: bool
+    validation_errors: tuple[str, ...]
+    syntax_error_count: int
+
+
+@dataclass(slots=True)
+class PatchVerificationSummary:
+    candidate_count: int
+    apply_success_rate: float
+    syntax_valid_rate: float
+    best_candidate_apply_valid: bool
+
+
+@dataclass(slots=True)
 class PatchPlan:
     file_path: str
     original_source: str
@@ -645,4 +667,7 @@ class EditRunOutput:
     span_candidates: tuple[EditTargetSpan, ...]
     patch_plan: PatchPlan
     diff_preview: str
+    apply_results: tuple[PatchApplyResult, ...] = ()
+    best_apply_result: PatchApplyResult | None = None
+    verification_summary: PatchVerificationSummary | None = None
     validation_summary: dict[str, Any] = field(default_factory=dict)
